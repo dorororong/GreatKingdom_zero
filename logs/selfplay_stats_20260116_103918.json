@@ -1,0 +1,171 @@
+{
+  "model_dir": "checkpoints/board_7/center_wall_on",
+  "iterations": [
+    150,
+    155,
+    160,
+    165,
+    170
+  ],
+  "num_games": 100,
+  "num_simulations": 300,
+  "c_puct": 2.0,
+  "dirichlet_alpha": 0.3,
+  "dirichlet_epsilon": 0.25,
+  "infer_batch_size": 32,
+  "infer_timeout": 0.001,
+  "mcts_eval_batch_size": 2,
+  "temperature": 0.1,
+  "results": {
+    "150": {
+      "capture": {
+        "1": {
+          "count": 33,
+          "moves": 957
+        },
+        "2": {
+          "count": 9,
+          "moves": 170
+        }
+      },
+      "territory": {
+        "1": {
+          "count": 46,
+          "moves": 1456,
+          "diff": 172
+        },
+        "2": {
+          "count": 0,
+          "moves": 0,
+          "diff": 0
+        }
+      },
+      "suicide": {
+        "1": 9,
+        "2": 0
+      },
+      "draws": 0,
+      "other": 0
+    },
+    "155": {
+      "capture": {
+        "1": {
+          "count": 53,
+          "moves": 1297
+        },
+        "2": {
+          "count": 17,
+          "moves": 552
+        }
+      },
+      "territory": {
+        "1": {
+          "count": 25,
+          "moves": 839,
+          "diff": 92
+        },
+        "2": {
+          "count": 5,
+          "moves": 146,
+          "diff": 12
+        }
+      },
+      "suicide": {
+        "1": 0,
+        "2": 0
+      },
+      "draws": 0,
+      "other": 0
+    },
+    "160": {
+      "capture": {
+        "1": {
+          "count": 77,
+          "moves": 2293
+        },
+        "2": {
+          "count": 0,
+          "moves": 0
+        }
+      },
+      "territory": {
+        "1": {
+          "count": 19,
+          "moves": 611,
+          "diff": 50
+        },
+        "2": {
+          "count": 3,
+          "moves": 99,
+          "diff": 21
+        }
+      },
+      "suicide": {
+        "1": 0,
+        "2": 0
+      },
+      "draws": 0,
+      "other": 0
+    },
+    "165": {
+      "capture": {
+        "1": {
+          "count": 47,
+          "moves": 1059
+        },
+        "2": {
+          "count": 19,
+          "moves": 456
+        }
+      },
+      "territory": {
+        "1": {
+          "count": 7,
+          "moves": 210,
+          "diff": 21
+        },
+        "2": {
+          "count": 22,
+          "moves": 654,
+          "diff": 36
+        }
+      },
+      "suicide": {
+        "1": 0,
+        "2": 0
+      },
+      "draws": 0,
+      "other": 0
+    },
+    "170": {
+      "capture": {
+        "1": {
+          "count": 43,
+          "moves": 1283
+        },
+        "2": {
+          "count": 7,
+          "moves": 184
+        }
+      },
+      "territory": {
+        "1": {
+          "count": 21,
+          "moves": 586,
+          "diff": 60
+        },
+        "2": {
+          "count": 1,
+          "moves": 37,
+          "diff": 2
+        }
+      },
+      "suicide": {
+        "1": 0,
+        "2": 0
+      },
+      "draws": 0,
+      "other": 0
+    }
+  }
+}

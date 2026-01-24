@@ -1,0 +1,13 @@
+[Iter 25] Loss: 1.8781 (P:1.3836, V:0.4945) | WinRate: 40.0% | AvgMoves: 17.8 | Buffer: 18474
+[Iter 30] Loss: 1.9874 (P:1.4326, V:0.5547) | WinRate: 20.0% | AvgMoves: 19.1 | Buffer: 36904
+[Iter 35] Loss: 2.0481 (P:1.4743, V:0.5739) | WinRate: 45.0% | AvgMoves: 19.9 | Buffer: 55664
+[Iter 40] Loss: 2.0818 (P:1.4816, V:0.6003) | WinRate: 50.0% | AvgMoves: 18.4 | Buffer: 75534
+[Iter 45] Loss: 2.1050 (P:1.4862, V:0.6188) | WinRate: 65.0% | AvgMoves: 20.2 | Buffer: 95762
+[Iter 50] Loss: 2.1318 (P:1.4829, V:0.6489) | WinRate: 75.0% | AvgMoves: 20.8 | Buffer: 100000
+[Iter 55] Loss: 2.1183 (P:1.4714, V:0.6469) | WinRate: 75.0% | AvgMoves: 20.1 | Buffer: 100000
+[Iter 60] Loss: 2.0842 (P:1.4536, V:0.6306) | WinRate: 50.0% | AvgMoves: 21.5 | Buffer: 100000
+[Iter 65] Loss: 2.0382 (P:1.4229, V:0.6153) | WinRate: 60.0% | AvgMoves: 22.3 | Buffer: 100000
+[Iter 70] Loss: 1.9993 (P:1.4042, V:0.5951) | WinRate: 70.0% | AvgMoves: 22.6 | Buffer: 100000
+[Iter 75] Loss: 1.9653 (P:1.3755, V:0.5898) | WinRate: 90.0% | AvgMoves: 22.4 | Buffer: 100000
+[Iter 80] Loss: 1.9354 (P:1.3513, V:0.5841) | WinRate: 75.0% | AvgMoves: 24.9 | Buffer: 100000
+[Iter 85] Loss: 1.9002 (P:1.3275, V:0.5727) | WinRate: 65.0% | AvgMoves: 24.0 | Buffer: 100000

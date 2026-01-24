@@ -1,0 +1,30 @@
+[Iter 40] Loss: 3.6361 (P:2.9505, V:0.6856) | WinRate: 0.0% | AvgMoves: 22.8 | Buffer: 138640
+[Iter 40] Eval Best detail: Capture Black: 2 | Avg Moves: 20.00
+[Iter 40] Eval Best detail: Capture White: 10 | Avg Moves: 34.00
+[Iter 40] Eval Best detail: Territory Black: 7 | Avg Diff: 9.14 | Avg Moves: 42.71
+[Iter 40] Eval Best detail: Territory White: 1 | Avg Diff: 10.00 | Avg Moves: 38.00
+[Iter 45] Loss: 3.6538 (P:2.9707, V:0.6832) | WinRate: 0.0% | AvgMoves: 22.2 | Buffer: 273216
+[Iter 45] Eval Best detail: Capture Black: 3 | Avg Moves: 27.67
+[Iter 45] Eval Best detail: Capture White: 5 | Avg Moves: 31.60
+[Iter 45] Eval Best detail: Territory Black: 9 | Avg Diff: 6.78 | Avg Moves: 55.11
+[Iter 45] Eval Best detail: Territory White: 3 | Avg Diff: 5.67 | Avg Moves: 31.33
+[Iter 50] Loss: 3.6489 (P:2.9608, V:0.6880) | WinRate: 0.0% | AvgMoves: 22.6 | Buffer: 412264
+[Iter 50] Eval Best detail: Capture Black: 13 | Avg Moves: 19.77
+[Iter 50] Eval Best detail: Capture White: 2 | Avg Moves: 18.00
+[Iter 50] Eval Best detail: Territory Black: 4 | Avg Diff: 12.00 | Avg Moves: 37.50
+[Iter 50] Eval Best detail: Territory White: 1 | Avg Diff: 2.00 | Avg Moves: 28.00
+[Iter 55] Loss: 3.6311 (P:2.9443, V:0.6868) | WinRate: 0.0% | AvgMoves: 23.1 | Buffer: 554568
+[Iter 55] Eval Best detail: Capture Black: 11 | Avg Moves: 22.27
+[Iter 55] Eval Best detail: Capture White: 1 | Avg Moves: 36.00
+[Iter 55] Eval Best detail: Territory Black: 8 | Avg Diff: 11.25 | Avg Moves: 39.88
+[Iter 55] Eval Best detail: Territory White: 0 | Avg Diff: 0.00 | Avg Moves: 0.00
+[Iter 60] Loss: 3.6054 (P:2.9069, V:0.6985) | WinRate: 0.0% | AvgMoves: 22.3 | Buffer: 697256
+[Iter 60] Eval Best detail: Capture Black: 13 | Avg Moves: 15.77
+[Iter 60] Eval Best detail: Capture White: 0 | Avg Moves: 0.00
+[Iter 60] Eval Best detail: Territory Black: 5 | Avg Diff: 12.60 | Avg Moves: 35.60
+[Iter 60] Eval Best detail: Territory White: 2 | Avg Diff: 1.50 | Avg Moves: 42.50
+[Iter 65] Loss: 3.5843 (P:2.8961, V:0.6881) | WinRate: 0.0% | AvgMoves: 22.6 | Buffer: 700000
+[Iter 65] Eval Best detail: Capture Black: 3 | Avg Moves: 27.00
+[Iter 65] Eval Best detail: Capture White: 3 | Avg Moves: 31.33
+[Iter 65] Eval Best detail: Territory Black: 14 | Avg Diff: 23.50 | Avg Moves: 40.29
+[Iter 65] Eval Best detail: Territory White: 0 | Avg Diff: 0.00 | Avg Moves: 0.00

@@ -1,0 +1,25 @@
+[Iter 105] Loss: 3.5793 (P:3.0475, V:0.5318) | WinRate: 0.0% | AvgMoves: 22.4 | Buffer: 133680
+[Iter 105] Eval Best detail: Capture Black: 14 | Avg Moves: 28.29
+[Iter 105] Eval Best detail: Capture White: 3 | Avg Moves: 18.67
+[Iter 105] Eval Best detail: Territory Black: 3 | Avg Diff: 7.33 | Avg Moves: 51.67
+[Iter 105] Eval Best detail: Territory White: 0 | Avg Diff: 0.00 | Avg Moves: 0.00
+[Iter 110] Loss: 3.6457 (P:3.0718, V:0.5740) | WinRate: 0.0% | AvgMoves: 23.1 | Buffer: 270272
+[Iter 110] Eval Best detail: Capture Black: 11 | Avg Moves: 19.36
+[Iter 110] Eval Best detail: Capture White: 8 | Avg Moves: 31.25
+[Iter 110] Eval Best detail: Territory Black: 1 | Avg Diff: 6.00 | Avg Moves: 56.00
+[Iter 110] Eval Best detail: Territory White: 0 | Avg Diff: 0.00 | Avg Moves: 0.00
+[Iter 115] Loss: 3.6530 (P:3.0569, V:0.5961) | WinRate: 0.0% | AvgMoves: 23.5 | Buffer: 411696
+[Iter 115] Eval Best detail: Capture Black: 8 | Avg Moves: 24.25
+[Iter 115] Eval Best detail: Capture White: 12 | Avg Moves: 32.33
+[Iter 115] Eval Best detail: Territory Black: 0 | Avg Diff: 0.00 | Avg Moves: 0.00
+[Iter 115] Eval Best detail: Territory White: 0 | Avg Diff: 0.00 | Avg Moves: 0.00
+[Iter 120] Loss: 3.6511 (P:3.0457, V:0.6054) | WinRate: 0.0% | AvgMoves: 25.3 | Buffer: 555752
+[Iter 120] Eval Best detail: Capture Black: 16 | Avg Moves: 19.50
+[Iter 120] Eval Best detail: Capture White: 1 | Avg Moves: 24.00
+[Iter 120] Eval Best detail: Territory Black: 2 | Avg Diff: 5.50 | Avg Moves: 56.00
+[Iter 120] Eval Best detail: Territory White: 1 | Avg Diff: 1.00 | Avg Moves: 69.00
+[Iter 125] Loss: 3.6518 (P:3.0358, V:0.6160) | WinRate: 0.0% | AvgMoves: 22.8 | Buffer: 700000
+[Iter 125] Eval Best detail: Capture Black: 20 | Avg Moves: 22.30
+[Iter 125] Eval Best detail: Capture White: 0 | Avg Moves: 0.00
+[Iter 125] Eval Best detail: Territory Black: 0 | Avg Diff: 0.00 | Avg Moves: 0.00
+[Iter 125] Eval Best detail: Territory White: 0 | Avg Diff: 0.00 | Avg Moves: 0.00
