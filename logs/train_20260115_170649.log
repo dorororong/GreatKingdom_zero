@@ -1,5 +1,0 @@
-[Iter 5] Loss: 3.4891 (P:2.6981, V:0.6801) | WinRate: 35.0% | AvgMoves: 12.8 | Buffer: 47568
-[Iter 10] Loss: 3.3999 (P:2.6545, V:0.6986) | WinRate: 25.0% | AvgMoves: 13.1 | Buffer: 95048
-[Iter 15] Loss: 3.3597 (P:2.6203, V:0.7139) | WinRate: 50.0% | AvgMoves: 12.9 | Buffer: 141264
-[Iter 20] Loss: 3.3149 (P:2.5969, V:0.7020) | WinRate: 45.0% | AvgMoves: 12.3 | Buffer: 187136
-[Iter 25] Loss: 3.2439 (P:2.5305, V:0.7017) | WinRate: 55.0% | AvgMoves: 12.1 | Buffer: 200000

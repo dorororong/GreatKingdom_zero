@@ -1,5 +1,0 @@
-[Iter 35] Loss: 3.3755 (P:2.7766, V:0.5989) | WinRate: 0.0% | AvgMoves: 23.9 | Buffer: 87008
-[Iter 35] Eval Best detail: Capture Black: 9 | Avg Moves: 17.22
-[Iter 35] Eval Best detail: Capture White: 10 | Avg Moves: 24.60
-[Iter 35] Eval Best detail: Territory Black: 0 | Avg Diff: 0.00 | Avg Moves: 0.00
-[Iter 35] Eval Best detail: Territory White: 1 | Avg Diff: 1.00 | Avg Moves: 46.00
