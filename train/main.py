@@ -138,7 +138,12 @@ def main():
         selfplay_record_interval=profile.get("selfplay_record_interval", 0),
         selfplay_record_dir=profile.get("selfplay_record_dir", "logs/selfplay_records"),
         ownership_loss_weight=profile.get("ownership_loss_weight", 0.2),
-        ownership_loss_weight_capture=profile.get("ownership_loss_weight_capture", 0.1)
+        ownership_loss_weight_capture=profile.get("ownership_loss_weight_capture", 0.1),
+        win_loss_weight=profile.get("win_loss_weight", 0.1),
+        win_type_loss_weight=profile.get("win_type_loss_weight", 0.1),
+        cache_debug_samples=profile.get("cache_debug_samples", 0),
+        cache_max_entries=profile.get("cache_max_entries", 50000),
+        train_buffer_min_factor=profile.get("train_buffer_min_factor", 2.0)
     )
 
 

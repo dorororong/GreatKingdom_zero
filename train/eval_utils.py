@@ -3,7 +3,7 @@ import numpy as np
 from env.env import GreatKingdomEnv
 from env.env_fast import GreatKingdomEnvFast
 from game_result import winner_id_from_step, winner_label_from_step
-from network import AlphaZeroNetwork, infer_head_type_from_state_dict
+from network import AlphaZeroNetwork, infer_head_type_from_state_dict, load_state_dict_safe
 from mcts_alphazero import AlphaZeroMCTS
 from mcts import MCTS
 from train.selfplay_workers import AsyncNetworkClient
@@ -38,7 +38,7 @@ def _init_eval_worker(network_state_dict, board_size, num_res_blocks, num_channe
         use_last_moves=use_last_moves,
         head_type=head_type
     )
-    _eval_network.load_state_dict(network_state_dict)
+    load_state_dict_safe(_eval_network, network_state_dict)
     _eval_network.eval()
     _eval_mcts = AlphaZeroMCTS(
         _eval_network, _eval_env,
@@ -299,7 +299,7 @@ def _init_eval_worker_best_async(worker_id, input_queue, output_queue, board_siz
         use_last_moves=use_last_moves,
         head_type=opponent_head
     )
-    opponent_network.load_state_dict(opponent_state_dict)
+    load_state_dict_safe(opponent_network, opponent_state_dict)
     opponent_network.eval()
 
     _eval_opponent_mcts = AlphaZeroMCTS(

@@ -7,7 +7,7 @@ from env.env import GreatKingdomEnv
 from env.env_fast import GreatKingdomEnvFast
 from mcts import MCTS
 from mcts_fast import MCTS as MCTSFast
-from network import AlphaZeroNetwork, infer_head_type_from_state_dict
+from network import AlphaZeroNetwork, infer_head_type_from_state_dict, load_state_dict_safe, encode_board_from_state
 from mcts_alphazero import AlphaZeroMCTS
 
 # 색상 정의
@@ -25,21 +25,27 @@ TERRITORY_WHITE = (255, 255, 255, 100)
 class GreatKingdomGUI:
     def __init__(self, board_size=5, cell_size=80, ai_type='mcts', mcts_simulations=1000, 
                  alphazero_simulations=100, checkpoint_path="checkpoints/alphazero_latest.pt",
-                 center_wall=True, komi=0, alphazero_black=True, use_fast_env=False):
+                 center_wall=True, komi=0, alphazero_black=True, use_fast_env=False,
+                 spectate_mode="az_vs_mcts", checkpoint_path_b=None):
         pygame.init()
         self.board_size = board_size
         self.cell_size = cell_size
         self.margin = int(self.cell_size * 0.5)
+        self.heatmap_size = int(self.cell_size * self.board_size * 0.5)
         self.info_panel_height = int(self.cell_size * 1.0)
         
-        self.width = self.cell_size * self.board_size + 2 * self.margin
-        self.height = self.cell_size * self.board_size + 2 * self.margin + self.info_panel_height
+        board_pixel = self.cell_size * self.board_size
+        self.board_origin_x = self.margin + self.heatmap_size + self.margin
+        self.board_origin_y = self.margin
+        self.width = self.board_origin_x + board_pixel + self.margin
+        self.height = board_pixel + 2 * self.margin + self.info_panel_height
         
         self.screen = pygame.display.set_mode((self.width, self.height))
         pygame.display.set_caption("Great Kingdom")
         
         self.font = pygame.font.SysFont("malgungothic", 24)
         self.large_font = pygame.font.SysFont("malgungothic", 48)
+        self.tiny_font = pygame.font.SysFont("malgungothic", max(10, self.cell_size // 4))
         
         self.use_fast_env = use_fast_env
         env_cls = GreatKingdomEnvFast if use_fast_env else GreatKingdomEnv
@@ -50,23 +56,38 @@ class GreatKingdomGUI:
         self.message = ""
         
         # AI 설정
+        
+        self.show_ownership_overlay = True  # 영토 예측 오버레이 표시 여부
         self.ai_type = ai_type  # 'mcts', 'alphazero', 'human' (2인 대전), 'spectate' (AI vs AI 관전)
         self.mcts = None
         self.alphazero_mcts = None
         self.alphazero_network = None
+        self.alphazero_mcts_b = None
+        self.alphazero_network_b = None
         self.mcts_simulations = mcts_simulations
         self.alphazero_simulations = alphazero_simulations
         self.checkpoint_path = checkpoint_path
+        self.checkpoint_path_b = checkpoint_path_b
         self.ai_thinking = False  # AI가 생각 중인지 표시
         self.last_human_action = None  # 사람의 마지막 수 기록 (AI에게 전달)
         self.last_ai_action = None  # AI의 마지막 수 기록 (관전 모드용)
         self.last_moves = (None, None)
         self.az_use_last_moves = False
+        self.az_use_liberty_features = True
+        self.az_liberty_bins = 2
+        self.az_label = "AlphaZero"
+        self.azb_use_last_moves = False
+        self.azb_use_liberty_features = True
+        self.azb_liberty_bins = 2
+        self.az_label_b = "AlphaZeroB"
         self.human_player = None  # 1=흑, 2=백 (None이면 색상 선택 화면)
-        self.game_started = False  # 게임 시작 여부
+        self.game_started = False  # game started flag
+        self._aux_cache_key = None
+        self._aux_cache = None
         
         # 관전 모드 설정
         self.alphazero_black = alphazero_black  # True: AlphaZero=흑, MCTS=백 / False: 반대
+        self.spectate_mode = spectate_mode
         self.spectate_delay = 500  # 관전 모드에서 수 사이의 딜레이 (ms)
         
         # AI 초기화
@@ -78,6 +99,9 @@ class GreatKingdomGUI:
         )
         self.reset_button_rect = pygame.Rect(
             self.width - 280, self.height - 80, 120, 50
+        )
+        self.overlay_button_rect = pygame.Rect(
+            self.width - 430, self.height - 80, 130, 50
         )
         
         # 색상 선택 버튼 (시작 화면용)
@@ -110,29 +134,32 @@ class GreatKingdomGUI:
             self._load_alphazero()
             print(f"AI: AlphaZero ({self.alphazero_simulations} simulations)")
         elif self.ai_type == 'spectate':
-            # 관전 모드: AlphaZero vs MCTS
+            # Spectate: AlphaZero vs MCTS or AlphaZero vs AlphaZero
             self._load_alphazero()
-            self.mcts = mcts_cls(self.env, simulations_per_move=self.mcts_simulations)
-            print(f"Spectate Mode: AlphaZero({self.alphazero_simulations} sims) vs MCTS({self.mcts_simulations} sims)")
-            if self.alphazero_black:
-                print("  AlphaZero plays Black, MCTS plays White")
+            if self.spectate_mode == 'az_vs_az' and self.alphazero_mcts_b is not None:
+                print(f"Spectate Mode: {self.az_label}({self.alphazero_simulations} sims) vs {self.az_label_b}({self.alphazero_simulations} sims)")
+                if self.alphazero_black:
+                    print(f"  {self.az_label} plays Black, {self.az_label_b} plays White")
+                else:
+                    print(f"  {self.az_label_b} plays Black, {self.az_label} plays White")
             else:
-                print("  MCTS plays Black, AlphaZero plays White")
-            self.game_started = True  # 관전 모드는 바로 시작
+                self.spectate_mode = 'az_vs_mcts'
+                self.mcts = mcts_cls(self.env, simulations_per_move=self.mcts_simulations)
+                print(f"Spectate Mode: AlphaZero({self.alphazero_simulations} sims) vs MCTS({self.mcts_simulations} sims)")
+                if self.alphazero_black:
+                    print("  AlphaZero plays Black, MCTS plays White")
+                else:
+                    print("  MCTS plays Black, AlphaZero plays White")
+            self.game_started = True  # start immediately
         else:  # human
             print("Mode: Human vs Human")
     
-    def _load_alphazero(self):
-        """AlphaZero model load."""
-        mcts_cls = MCTSFast if self.use_fast_env else MCTS
-        if not os.path.exists(self.checkpoint_path):
-            print(f"Warning: Checkpoint not found: {self.checkpoint_path}")
-            print("Falling back to MCTS")
-            self.ai_type = 'mcts'
-            self.mcts = mcts_cls(self.env, simulations_per_move=self.mcts_simulations)
-            return
+    def _load_alphazero_model(self, checkpoint_path):
+        if not checkpoint_path or not os.path.exists(checkpoint_path):
+            print(f"Warning: Checkpoint not found: {checkpoint_path}")
+            return None
 
-        checkpoint = torch.load(self.checkpoint_path, map_location='cpu', weights_only=False)
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
         num_res_blocks = checkpoint.get('num_res_blocks', 3)
         num_channels = checkpoint.get('num_channels', 64)
@@ -180,15 +207,13 @@ class GreatKingdomGUI:
             else:
                 raise RuntimeError(f"Unsupported input channels in checkpoint: {in_channels}")
 
-        self.az_use_last_moves = use_last_moves
-
         print(
             f"Network config: num_res_blocks={num_res_blocks}, num_channels={num_channels}, "
             f"use_liberty_features={use_liberty_features}, liberty_bins={liberty_bins}, "
             f"use_last_moves={use_last_moves}, head_type={head_type}"
         )
 
-        self.alphazero_network = AlphaZeroNetwork(
+        network = AlphaZeroNetwork(
             board_size=self.board_size,
             num_res_blocks=num_res_blocks,
             num_channels=num_channels,
@@ -197,12 +222,11 @@ class GreatKingdomGUI:
             use_last_moves=use_last_moves,
             head_type=head_type
         )
+        load_state_dict_safe(network, checkpoint['network'])
+        network.eval()
 
-        self.alphazero_network.load_state_dict(checkpoint['network'])
-        self.alphazero_network.eval()
-
-        self.alphazero_mcts = AlphaZeroMCTS(
-            self.alphazero_network,
+        mcts = AlphaZeroMCTS(
+            network,
             self.env,
             num_simulations=self.alphazero_simulations,
             c_puct=1.5,
@@ -211,25 +235,186 @@ class GreatKingdomGUI:
             use_last_moves=use_last_moves
         )
 
+        label = os.path.splitext(os.path.basename(checkpoint_path))[0]
+        return {
+            "network": network,
+            "mcts": mcts,
+            "use_last_moves": use_last_moves,
+            "use_liberty_features": use_liberty_features,
+            "liberty_bins": liberty_bins,
+            "label": label,
+            "checkpoint": checkpoint
+        }
+
+    def _load_alphazero(self):
+        """AlphaZero model load."""
+        mcts_cls = MCTSFast if self.use_fast_env else MCTS
+        model = self._load_alphazero_model(self.checkpoint_path)
+        if model is None:
+            print("Falling back to MCTS")
+            self.ai_type = 'mcts'
+            self.mcts = mcts_cls(self.env, simulations_per_move=self.mcts_simulations)
+            return
+
+        self.alphazero_network = model["network"]
+        self.alphazero_mcts = model["mcts"]
+        self.az_use_last_moves = model["use_last_moves"]
+        self.az_use_liberty_features = model["use_liberty_features"]
+        self.az_liberty_bins = model["liberty_bins"]
+        self.az_label = model["label"]
+
         print(f"Loaded AlphaZero from: {self.checkpoint_path}")
-        if 'iteration' in checkpoint:
-            print(f"  Iteration: {checkpoint['iteration']}")
-        if 'total_games' in checkpoint:
-            print(f"  Total games: {checkpoint['total_games']}")
+        if 'iteration' in model["checkpoint"]:
+            print(f"  Iteration: {model['checkpoint']['iteration']}")
+        if 'total_games' in model["checkpoint"]:
+            print(f"  Total games: {model['checkpoint']['total_games']}")
+
+        if self.ai_type == 'spectate' and self.spectate_mode == "az_vs_az":
+            model_b = self._load_alphazero_model(self.checkpoint_path_b)
+            if model_b is None:
+                print("Spectate az_vs_az requested but second checkpoint missing. Falling back to az_vs_mcts.")
+                self.spectate_mode = "az_vs_mcts"
+            else:
+                self.alphazero_network_b = model_b["network"]
+                self.alphazero_mcts_b = model_b["mcts"]
+                self.azb_use_last_moves = model_b["use_last_moves"]
+                self.azb_use_liberty_features = model_b["use_liberty_features"]
+                self.azb_liberty_bins = model_b["liberty_bins"]
+                self.az_label_b = model_b["label"]
+
+    def _make_state(self, use_last_moves):
+        base_state = (
+            self.env.board.copy(),
+            self.env.current_player,
+            self.env.consecutive_passes
+        )
+        if use_last_moves:
+            return (
+                self.env.board.copy(),
+                self.env.current_player,
+                self.env.consecutive_passes,
+                self.last_moves
+            )
+        return base_state
+
+    def _get_active_az_model(self):
+        if self.ai_type == 'spectate' and self.spectate_mode == 'az_vs_az' and self.alphazero_network_b is not None:
+            if (self.env.current_player == 1) == self.alphazero_black:
+                return (self.alphazero_network, self.az_use_last_moves, self.az_use_liberty_features, self.az_liberty_bins)
+            return (self.alphazero_network_b, self.azb_use_last_moves, self.azb_use_liberty_features, self.azb_liberty_bins)
+        if self.alphazero_network is None:
+            return None
+        return (self.alphazero_network, self.az_use_last_moves, self.az_use_liberty_features, self.az_liberty_bins)
+
+    def _get_ownership_probs(self):
+        active = self._get_active_az_model()
+        if active is None:
+            return None, None, None, None
+        network, use_last_moves, use_liberty_features, liberty_bins = active
+        state = self._make_state(use_last_moves)
+        cache_key = (
+            id(network),
+            self.env.current_player,
+            self.env.consecutive_passes,
+            self.last_moves,
+            self.env.board.tobytes()
+        )
+        if cache_key == self._aux_cache_key and self._aux_cache is not None:
+            return self._aux_cache
+        encoded = encode_board_from_state(
+            state[0], state[1], self.board_size, self.last_moves,
+            use_liberty_features=use_liberty_features,
+            liberty_bins=liberty_bins,
+            use_last_moves=use_last_moves
+        )
+        with torch.no_grad():
+            device = next(network.parameters()).device
+            x = torch.from_numpy(encoded).unsqueeze(0).to(device)
+            _, _, ownership_logits, win_logit, win_type_logit = network(x)
+            probs = torch.sigmoid(ownership_logits).squeeze(0).cpu().numpy()
+            win_prob = torch.sigmoid(win_logit).squeeze(0).cpu().numpy().item()
+            win_type_prob = torch.sigmoid(win_type_logit).squeeze(0).cpu().numpy().item()
+        p_black = probs[0]
+        p_white = probs[1]
+        denom = p_black + p_white + 1e-6
+        signed = (p_black - p_white) / denom
+        confidence = np.maximum(p_black, p_white)
+        self._aux_cache_key = cache_key
+        self._aux_cache = (signed, confidence, win_prob, win_type_prob)
+        return signed, confidence, win_prob, win_type_prob
+
+    def _blend_color(self, signed, confidence):
+        base_black = np.array([30, 30, 30], dtype=np.float32)
+        base_white = np.array([235, 235, 235], dtype=np.float32)
+        neutral = np.array([160, 160, 160], dtype=np.float32)
+        ratio = (signed + 1.0) * 0.5
+        color = base_white * (1.0 - ratio) + base_black * ratio
+        color = neutral * (1.0 - confidence) + color * confidence
+        return tuple(color.astype(int))
+
+    def draw_ownership_heatmap(self):
+        panel_rect = pygame.Rect(self.margin, self.board_origin_y, self.heatmap_size, self.heatmap_size)
+        pygame.draw.rect(self.screen, (235, 235, 235), panel_rect)
+
+        signed, confidence, _, _ = self._get_ownership_probs()
+        if signed is None:
+            signed = np.zeros((self.board_size, self.board_size), dtype=np.float32)
+            confidence = np.zeros((self.board_size, self.board_size), dtype=np.float32)
+
+        surface = pygame.Surface((self.heatmap_size, self.heatmap_size), pygame.SRCALPHA)
+        cell = self.heatmap_size / max(1, self.board_size)
+        for r in range(self.board_size):
+            y0 = int(r * cell)
+            y1 = int((r + 1) * cell)
+            for c in range(self.board_size):
+                x0 = int(c * cell)
+                x1 = int((c + 1) * cell)
+                stone = self.env.board[r, c]
+                if stone == 1:
+                    color_rgb = (0, 0, 0)
+                elif stone == 2:
+                    color_rgb = (255, 255, 255)
+                elif stone == 3:
+                    color_rgb = (80, 80, 80)
+                else:
+                    color_rgb = self._blend_color(float(signed[r, c]), float(confidence[r, c]))
+                pygame.draw.rect(surface, (*color_rgb, 180), pygame.Rect(x0, y0, max(1, x1 - x0), max(1, y1 - y0)))
+        self.screen.blit(surface, panel_rect.topleft)
+
+        pygame.draw.rect(self.screen, BLACK, panel_rect, 2)
+        for i in range(self.board_size + 1):
+            x = panel_rect.x + int(i * cell)
+            y = panel_rect.y + int(i * cell)
+            pygame.draw.line(self.screen, (60, 60, 60), (x, panel_rect.y), (x, panel_rect.y + self.heatmap_size), 1)
+            pygame.draw.line(self.screen, (60, 60, 60), (panel_rect.x, y), (panel_rect.x + self.heatmap_size, y), 1)
+        if cell >= 18:
+            for r in range(self.board_size):
+                for c in range(self.board_size):
+                    if self.env.board[r, c] == 0:
+                        value = float(signed[r, c])
+                        text = f"{value:.1f}"
+                        color = BLACK if value >= 0 else WHITE
+                        text_surf = self.tiny_font.render(text, True, color)
+                        tx = panel_rect.x + int(c * cell + cell / 2 - text_surf.get_width() / 2)
+                        ty = panel_rect.y + int(r * cell + cell / 2 - text_surf.get_height() / 2)
+                        self.screen.blit(text_surf, (tx, ty))
+        label = self.font.render("Ownership", True, BLACK)
+        self.screen.blit(label, (panel_rect.x, panel_rect.y - label.get_height() - 4))
 
     def draw_board(self):
         self.screen.fill(WOOD)
+        self.draw_ownership_heatmap()
         
         # 그리드 그리기
         for i in range(self.board_size):
             # 가로줄
-            start_pos = (self.margin + self.cell_size // 2, self.margin + self.cell_size // 2 + i * self.cell_size)
-            end_pos = (self.width - self.margin - self.cell_size // 2, self.margin + self.cell_size // 2 + i * self.cell_size)
+            start_pos = (self.board_origin_x + self.cell_size // 2, self.board_origin_y + self.cell_size // 2 + i * self.cell_size)
+            end_pos = (self.board_origin_x + self.cell_size * self.board_size - self.cell_size // 2, self.board_origin_y + self.cell_size // 2 + i * self.cell_size)
             pygame.draw.line(self.screen, BLACK, start_pos, end_pos, 2)
             
             # 세로줄
-            start_pos = (self.margin + self.cell_size // 2 + i * self.cell_size, self.margin + self.cell_size // 2)
-            end_pos = (self.margin + self.cell_size // 2 + i * self.cell_size, self.height - self.info_panel_height - self.margin - self.cell_size // 2)
+            start_pos = (self.board_origin_x + self.cell_size // 2 + i * self.cell_size, self.board_origin_y + self.cell_size // 2)
+            end_pos = (self.board_origin_x + self.cell_size // 2 + i * self.cell_size, self.board_origin_y + self.cell_size * self.board_size - self.cell_size // 2)
             pygame.draw.line(self.screen, BLACK, start_pos, end_pos, 2)
 
         # 영토 표시 (반투명)
@@ -241,8 +426,8 @@ class GreatKingdomGUI:
             
             for r in range(self.board_size):
                 for c in range(self.board_size):
-                    cx = self.margin + c * self.cell_size
-                    cy = self.margin + r * self.cell_size
+                    cx = self.board_origin_x + c * self.cell_size
+                    cy = self.board_origin_y + r * self.cell_size
                     
                     if black_territory[r, c]:
                         pygame.draw.rect(surface, (0, 0, 0, 50), surface.get_rect())
@@ -256,11 +441,25 @@ class GreatKingdomGUI:
                         # 작은 점 표시
                         pygame.draw.circle(self.screen, WHITE, (cx + self.cell_size//2, cy + self.cell_size//2), 5)
 
+        if self.show_ownership_overlay:
+            signed, confidence, _, _ = self._get_ownership_probs()
+            if signed is not None:
+                overlay = pygame.Surface((self.cell_size, self.cell_size), pygame.SRCALPHA)
+                for r in range(self.board_size):
+                    for c in range(self.board_size):
+                        color_rgb = self._blend_color(float(signed[r, c]), float(confidence[r, c]))
+                        alpha = int(60 + 140 * float(confidence[r, c]))
+                        overlay.fill((*color_rgb, alpha))
+                        self.screen.blit(
+                            overlay,
+                            (self.board_origin_x + c * self.cell_size, self.board_origin_y + r * self.cell_size)
+                        )
+
         # 돌 그리기
         for r in range(self.board_size):
             for c in range(self.board_size):
-                cx = self.margin + c * self.cell_size + self.cell_size // 2
-                cy = self.margin + r * self.cell_size + self.cell_size // 2
+                cx = self.board_origin_x + c * self.cell_size + self.cell_size // 2
+                cy = self.board_origin_y + r * self.cell_size + self.cell_size // 2
                 
                 stone = self.env.board[r, c]
                 if stone == 1:  # Black
@@ -304,17 +503,20 @@ class GreatKingdomGUI:
         self.screen.blit(info_surf, info_rect)
     
     def draw_spectate_ui(self):
-        """관전 모드 UI 그리기"""
-        # 상단에 관전 모드 표시
-        if self.alphazero_black:
-            spectate_text = "[SPECTATE] AlphaZero (Black) vs MCTS (White)"
+        # Spectate mode label
+        if self.spectate_mode == 'az_vs_az' and self.alphazero_mcts_b is not None:
+            black_name = self.az_label if self.alphazero_black else self.az_label_b
+            white_name = self.az_label_b if self.alphazero_black else self.az_label
+            spectate_text = f"[SPECTATE] {black_name} (Black) vs {white_name} (White)"
         else:
-            spectate_text = "[SPECTATE] MCTS (Black) vs AlphaZero (White)"
+            if self.alphazero_black:
+                spectate_text = "[SPECTATE] AlphaZero (Black) vs MCTS (White)"
+            else:
+                spectate_text = "[SPECTATE] MCTS (Black) vs AlphaZero (White)"
         text_surf = self.font.render(spectate_text, True, RED)
         text_rect = text_surf.get_rect(center=(self.width // 2, 15))
         pygame.draw.rect(self.screen, WHITE, text_rect.inflate(20, 10))
         self.screen.blit(text_surf, text_rect)
-
     def draw_ui(self):
         # 하단 패널 배경
         pygame.draw.rect(self.screen, GRAY, (0, self.height - self.info_panel_height, self.width, self.info_panel_height))
@@ -331,11 +533,16 @@ class GreatKingdomGUI:
         if not self.done:
             turn_text = "Black's Turn" if self.env.current_player == 1 else "White's Turn"
             if self.ai_type == 'spectate':
-                # 관전 모드: 어떤 AI의 턴인지 표시
-                if self.alphazero_black:
-                    ai_name = "AlphaZero" if self.env.current_player == 1 else "MCTS"
+                if self.spectate_mode == 'az_vs_az' and self.alphazero_mcts_b is not None:
+                    if self.alphazero_black:
+                        ai_name = self.az_label if self.env.current_player == 1 else self.az_label_b
+                    else:
+                        ai_name = self.az_label_b if self.env.current_player == 1 else self.az_label
                 else:
-                    ai_name = "MCTS" if self.env.current_player == 1 else "AlphaZero"
+                    if self.alphazero_black:
+                        ai_name = 'AlphaZero' if self.env.current_player == 1 else 'MCTS'
+                    else:
+                        ai_name = 'MCTS' if self.env.current_player == 1 else 'AlphaZero'
                 turn_text += f" ({ai_name})"
             elif self.ai_type != 'human' and self.human_player is not None:
                 if self.env.current_player == self.human_player:
@@ -355,6 +562,22 @@ class GreatKingdomGUI:
             score_text = f"Territory - B: {scores['black']}  W: {scores['white']}"
             score_surf = self.font.render(score_text, True, BLACK)
             self.screen.blit(score_surf, (20, self.height - 40))
+
+            _, _, win_prob, win_type_prob = self._get_ownership_probs()
+            if win_prob is not None:
+                win_text = f"Win P(B): {win_prob:.2f}  P(W): {1.0 - win_prob:.2f}"
+                win_surf = self.font.render(win_text, True, BLACK)
+                self.screen.blit(
+                    win_surf,
+                    (self.width // 2 - win_surf.get_width() // 2, self.height - 80)
+                )
+
+                win_type_text = f"WinType P(Cap): {win_type_prob:.2f}  Terr: {1.0 - win_type_prob:.2f}"
+                win_type_surf = self.font.render(win_type_text, True, BLACK)
+                self.screen.blit(
+                    win_type_surf,
+                    (self.width // 2 - win_type_surf.get_width() // 2, self.height - 50)
+                )
             
         else:
             # 게임 종료 메시지
@@ -388,6 +611,16 @@ class GreatKingdomGUI:
         reset_text = self.font.render("RESET", True, WHITE)
         text_rect = reset_text.get_rect(center=self.reset_button_rect.center)
         self.screen.blit(reset_text, text_rect)
+
+        overlay_label = "OWN ON" if self.show_ownership_overlay else "OWN OFF"
+        pygame.draw.rect(self.screen, (90, 90, 90), self.overlay_button_rect)
+        overlay_btn_text = self.font.render(overlay_label, True, WHITE)
+        overlay_btn_rect = overlay_btn_text.get_rect(center=self.overlay_button_rect.center)
+        self.screen.blit(overlay_btn_text, overlay_btn_rect)
+
+        overlay_text = f"Ownership overlay: {'ON' if self.show_ownership_overlay else 'OFF'} (O)"
+        overlay_surf = self.font.render(overlay_text, True, BLACK)
+        self.screen.blit(overlay_surf, (self.width - overlay_surf.get_width() - 20, self.height - 40))
 
     def handle_click(self, pos):
         self.message = ""
@@ -425,10 +658,14 @@ class GreatKingdomGUI:
             self.last_human_action = None  # 리셋 시 초기화
             self.last_ai_action = None
             self.last_moves = (None, None)
-            self.game_started = False  # 색상 선택 화면으로 돌아가기
+            self.game_started = False  # reset to color selection
             self.human_player = None
             # AI 재초기화
             self._init_ai()
+            return
+
+        if self.overlay_button_rect.collidepoint(pos):
+            self.show_ownership_overlay = not self.show_ownership_overlay
             return
 
         if self.done:
@@ -441,14 +678,15 @@ class GreatKingdomGUI:
         # 보드 클릭 확인
         x, y = pos
         # 마진 제외
-        if x < self.margin or x > self.width - self.margin:
+        board_width = self.cell_size * self.board_size
+        if x < self.board_origin_x or x > self.board_origin_x + board_width:
             return
-        if y < self.margin or y > self.height - self.info_panel_height - self.margin:
+        if y < self.board_origin_y or y > self.board_origin_y + board_width:
             return
             
         # 좌표 변환
-        c = (x - self.margin) // self.cell_size
-        r = (y - self.margin) // self.cell_size
+        c = (x - self.board_origin_x) // self.cell_size
+        r = (y - self.board_origin_y) // self.cell_size
         
         if 0 <= r < self.board_size and 0 <= c < self.board_size:
             action = r * self.board_size + c
@@ -487,16 +725,35 @@ class GreatKingdomGUI:
 
         # ?? ??: AlphaZero vs MCTS
         if self.ai_type == 'spectate':
-            # alphazero_black=True: AlphaZero=?(1), MCTS=?(2)
-            # alphazero_black=False: MCTS=?(1), AlphaZero=?(2)
-            is_alphazero_turn = (self.env.current_player == 1) == self.alphazero_black
-
-            if is_alphazero_turn:
-                action, _ = self.alphazero_mcts.run(az_state, temperature=0)
-                ai_name = "AlphaZero"
+            if self.spectate_mode == 'az_vs_az' and self.alphazero_mcts_b is not None:
+                if self.alphazero_black:
+                    black_mcts = self.alphazero_mcts
+                    black_state = self._make_state(self.az_use_last_moves)
+                    black_name = self.az_label
+                    white_mcts = self.alphazero_mcts_b
+                    white_state = self._make_state(self.azb_use_last_moves)
+                    white_name = self.az_label_b
+                else:
+                    black_mcts = self.alphazero_mcts_b
+                    black_state = self._make_state(self.azb_use_last_moves)
+                    black_name = self.az_label_b
+                    white_mcts = self.alphazero_mcts
+                    white_state = self._make_state(self.az_use_last_moves)
+                    white_name = self.az_label
+                if self.env.current_player == 1:
+                    action, _ = black_mcts.run(black_state, temperature=0)
+                    ai_name = black_name
+                else:
+                    action, _ = white_mcts.run(white_state, temperature=0)
+                    ai_name = white_name
             else:
-                action = self.mcts.run(base_state, opponent_last_action=self.last_ai_action)
-                ai_name = "MCTS"
+                is_alphazero_turn = (self.env.current_player == 1) == self.alphazero_black
+                if is_alphazero_turn:
+                    action, _ = self.alphazero_mcts.run(self._make_state(self.az_use_last_moves), temperature=0)
+                    ai_name = self.az_label
+                else:
+                    action = self.mcts.run(self._make_state(False), opponent_last_action=self.last_ai_action)
+                    ai_name = 'MCTS'
 
             # ?? ??
             self.obs, reward, self.done, self.info = self.env.step(action)
@@ -512,9 +769,8 @@ class GreatKingdomGUI:
                 print(f"{ai_name}: ({r}, {c})")
 
             if self.done:
-                print("Game Over:", self.info)
+                print('Game Over:', self.info)
             return
-
         ai_player = 1 if self.human_player == 2 else 2  # AI? ??? ???
 
         if self.env.current_player == ai_player:  # AI? ?
@@ -592,9 +848,11 @@ class GreatKingdomGUI:
                             self.last_human_action = None
                             self.last_ai_action = None
                             self.last_moves = (None, None)
-                            self.game_started = False
+                            self.game_started = False  # reset to color selection
                             self.human_player = None
                             self._init_ai()
+                    elif event.key == pygame.K_o:  # O key for ownership overlay
+                        self.show_ownership_overlay = not self.show_ownership_overlay
 
             # 화면 그리기
             if not self.game_started:
@@ -618,15 +876,20 @@ if __name__ == "__main__":
     parser.add_argument('--ai', type=str, default='alphazero',
                         choices=['alphazero', 'mcts', 'human', 'spectate'],
                         help='AI 타입: alphazero, mcts, human (2인 대전), spectate (AI vs AI 관전)')
-    parser.add_argument('--checkpoint', type=str, default='checkpoints/board_9/center_wall_on/alphazero_latest.pt',
-                        help='AlphaZero 체크포인트 경로')
+    parser.add_argument('--checkpoint', type=str, default='checkpoints/board_7/center_wall_on/alphazero_latest.pt',
+                        help='AlphaZero ???????????')
+    parser.add_argument('--checkpoint_b', type=str, default='',
+                        help='Second AlphaZero checkpoint for az_vs_az spectate')
+    parser.add_argument('--spectate_mode', type=str, default='az_vs_mcts',
+                        choices=['az_vs_mcts', 'az_vs_az'],
+                        help='Spectate mode: az_vs_mcts or az_vs_az')
     parser.add_argument('--fast_env', type=str, default='auto',
                         help='Fast env/mcts ???? (True/False/auto)')
     parser.add_argument('--mcts_sims', type=int, default=200,
                         help='Pure MCTS 시뮬레이션 횟수')
     parser.add_argument('--alphazero_sims', type=int, default=600,
                         help='AlphaZero MCTS 시뮬레이션 횟수')
-    parser.add_argument('--board_size', type=int, default=9,
+    parser.add_argument('--board_size', type=int, default=7,
                         help='보드 크기')
     parser.add_argument('--center_wall', type=str, default='auto',
                         help='center wall setting (True/False/auto)')
@@ -678,9 +941,11 @@ if __name__ == "__main__":
         mcts_simulations=args.mcts_sims,
         alphazero_simulations=args.alphazero_sims,
         checkpoint_path=args.checkpoint,
+        checkpoint_path_b=args.checkpoint_b or None,
         center_wall=center_wall,
         komi=komi,
         alphazero_black=args.alphazero_black.lower() == 'true',
-        use_fast_env=args.fast_env.lower() == 'true'
+        use_fast_env=args.fast_env.lower() == 'true',
+        spectate_mode=args.spectate_mode
     )
     game.run()

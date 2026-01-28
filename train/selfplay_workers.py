@@ -2,19 +2,21 @@ import time
 import numpy as np
 import torch
 import multiprocessing as mp
+from collections import OrderedDict
 
 from env.env import GreatKingdomEnv
 from env.env_fast import GreatKingdomEnvFast
 from game_result import winner_id_from_step
-from network import AlphaZeroNetwork, encode_board_from_state, infer_head_type_from_state_dict
+from network import AlphaZeroNetwork, encode_board_from_state, infer_head_type_from_state_dict, load_state_dict_safe
 from mcts_alphazero import AlphaZeroMCTS
+from symmetry import canonicalize_encoded_state, invert_action_probs
 
 
 class BatchInferenceServer:
     def __init__(self, network_state_dict, board_size, num_res_blocks, num_channels,
                  device=None, batch_size=64, timeout=0.01, stats_queue=None,
                  use_liberty_features=True, liberty_bins=2, use_last_moves=False,
-                 network_head="fc"):
+                 network_head="fc", cache_debug_samples=0, cache_max_entries=50000):
         self.network_state_dict = network_state_dict
         self.board_size = board_size
         self.num_res_blocks = num_res_blocks
@@ -30,6 +32,14 @@ class BatchInferenceServer:
         self.liberty_bins = liberty_bins
         self.use_last_moves = use_last_moves
         self.network_head = network_head
+        self.cache_max_entries = int(cache_max_entries)
+        self._eval_cache = OrderedDict()
+        self._cache_hits = 0
+        self._cache_misses = 0
+        self._deduped = 0
+        self._unique_evals = 0
+        self.cache_debug_samples = int(cache_debug_samples)
+        self._debug_samples = []
 
     def run(self):
         network = AlphaZeroNetwork(
@@ -41,7 +51,7 @@ class BatchInferenceServer:
             use_last_moves=self.use_last_moves,
             head_type=self.network_head
         ).to(self.device)
-        network.load_state_dict(self.network_state_dict)
+        load_state_dict_safe(network, self.network_state_dict)
         network.eval()
 
         print(f"?? Inference Server Started on {self.device} (Batch: {self.batch_size})")
@@ -71,25 +81,89 @@ class BatchInferenceServer:
                 continue
             total_wait_time += (time.time() - start_wait)
 
-            worker_ids, req_ids, states = zip(*batch_items)
-            states_tensor = torch.FloatTensor(np.array(states)).to(self.device)
-            with torch.no_grad():
-                t0 = time.perf_counter()
-                if self.device.startswith("cuda"):
-                    with torch.amp.autocast("cuda"):
-                        policies, values, _ = network(states_tensor)
-                else:
-                    policies, values, _ = network(states_tensor)
-                total_infer_time += (time.perf_counter() - t0)
+            pending = {}
+            for worker_id, req_id, state in batch_items:
+                canon_state, transform_id, key = canonicalize_encoded_state(state)
+                cached = self._eval_cache.get(key)
+                if cached is not None:
+                    self._cache_hits += 1
+                    policy_canon, value = cached
+                    policy = invert_action_probs(policy_canon, self.board_size, transform_id)
+                    self.output_queues[worker_id].put((req_id, policy, value))
+                    continue
+                self._cache_misses += 1
+                if key not in pending:
+                    pending[key] = {
+                        "canon_state": canon_state,
+                        "requests": []
+                    }
+                pending[key]["requests"].append((worker_id, req_id, transform_id))
 
-            policies = torch.exp(policies).float().cpu().numpy()
-            values = values.squeeze(1).float().cpu().numpy()
+            if pending:
+                keys = list(pending.keys())
+                unique_count = len(keys)
+                total_pending = sum(len(v["requests"]) for v in pending.values())
+                self._deduped += max(0, total_pending - unique_count)
+                self._unique_evals += unique_count
+                states_tensor = torch.FloatTensor(
+                    np.array([pending[k]["canon_state"] for k in keys])
+                ).to(self.device)
+                with torch.no_grad():
+                    t0 = time.perf_counter()
+                    if self.device.startswith("cuda"):
+                        with torch.amp.autocast("cuda"):
+                            policies, values, _, _, _ = network(states_tensor)
+                    else:
+                        policies, values, _, _, _ = network(states_tensor)
+                    total_infer_time += (time.perf_counter() - t0)
+
+                policies = torch.exp(policies).float().cpu().numpy()
+                values = values.squeeze(1).float().cpu().numpy()
+
+                total_batches += 1
+                for idx, key in enumerate(keys):
+                    policy_canon = policies[idx]
+                    value = float(values[idx])
+                    if self.cache_debug_samples > 0 and len(self._debug_samples) < self.cache_debug_samples:
+                        self._debug_samples.append((policy_canon, value, pending[key]["canon_state"]))
+                    self._eval_cache[key] = (policy_canon, value)
+                    if self.cache_max_entries and len(self._eval_cache) > self.cache_max_entries:
+                        self._eval_cache.popitem(last=False)
+                    for worker_id, req_id, transform_id in pending[key]["requests"]:
+                        policy = invert_action_probs(policy_canon, self.board_size, transform_id)
+                        self.output_queues[worker_id].put((req_id, policy, value))
 
             total_requests += len(batch_items)
-            total_batches += 1
 
-            for idx, worker_id in enumerate(worker_ids):
-                self.output_queues[worker_id].put((req_ids[idx], policies[idx], values[idx]))
+        cache_size = len(self._eval_cache)
+        debug_samples = 0
+        debug_policy_l1 = None
+        debug_value_max = None
+        if self.cache_debug_samples > 0 and self._debug_samples:
+            sample_states = []
+            cached_policies = []
+            cached_values = []
+            for policy_canon, value, canon_state in self._debug_samples:
+                sample_states.append(canon_state)
+                cached_policies.append(policy_canon)
+                cached_values.append(float(value))
+            states_tensor = torch.FloatTensor(np.array(sample_states)).to(self.device)
+            with torch.no_grad():
+                if self.device.startswith("cuda"):
+                    with torch.amp.autocast("cuda"):
+                        policies, values, _, _, _ = network(states_tensor)
+                else:
+                    policies, values, _, _, _ = network(states_tensor)
+            policies = torch.exp(policies).float().cpu().numpy()
+            values = values.squeeze(1).float().cpu().numpy()
+            diffs = []
+            vdiffs = []
+            for idx in range(len(cached_policies)):
+                diffs.append(np.mean(np.abs(policies[idx] - cached_policies[idx])))
+                vdiffs.append(abs(float(values[idx]) - cached_values[idx]))
+            debug_samples = len(diffs)
+            debug_policy_l1 = float(np.mean(diffs)) if diffs else None
+            debug_value_max = float(np.max(vdiffs)) if vdiffs else None
 
         if self.stats_queue is not None:
             self.stats_queue.put({
@@ -97,7 +171,17 @@ class BatchInferenceServer:
                 "total_batches": total_batches,
                 "total_infer_time": total_infer_time,
                 "total_wait_time": total_wait_time,
-                "batch_size": self.batch_size
+                "batch_size": self.batch_size,
+                "cache_hits": self._cache_hits,
+                "cache_misses": self._cache_misses,
+                "cache_size": cache_size,
+                "deduped": self._deduped,
+                "unique_evals": self._unique_evals,
+                "forward_calls": self._unique_evals,
+                "cache_hits_bypassed": self._cache_hits,
+                "debug_samples": debug_samples,
+                "debug_policy_l1": debug_policy_l1,
+                "debug_value_max": debug_value_max
             })
 
 
@@ -202,7 +286,7 @@ def _init_worker(network_state_dict, board_size, num_res_blocks, num_channels, n
         use_last_moves=use_last_moves,
         head_type=head_type
     )
-    _worker_network.load_state_dict(network_state_dict)
+    load_state_dict_safe(_worker_network, network_state_dict)
     _worker_network.eval()
 
     _worker_mcts = AlphaZeroMCTS(
@@ -328,6 +412,25 @@ def _play_one_game(temperature_schedule):
         black = info.get("black_territory", 0) if isinstance(info, dict) else 0
         white = info.get("white_territory", 0) if isinstance(info, dict) else 0
         territory_diff = abs(int(black) - int(white))
+    if winner == 1:
+        win_target = 1.0
+        win_weight = 1.0
+    elif winner == 2:
+        win_target = 0.0
+        win_weight = 1.0
+    else:
+        win_target = 0.5
+        win_weight = 0.0
+
+    if win_type == "capture":
+        win_type_target = 1.0
+        win_type_weight = 1.0
+    elif win_type == "territory":
+        win_type_target = 0.0
+        win_type_weight = 1.0
+    else:
+        win_type_target = 0.5
+        win_type_weight = 0.0
     ownership_target = _get_ownership_target(_worker_env)
     ownership_weight = (
         _worker_ownership_loss_weight_capture
@@ -346,7 +449,19 @@ def _play_one_game(temperature_schedule):
         else:
             value = -1.0
 
-        final_data.append((enc_state, policy, value, ownership_target, ownership_weight))
+        final_data.append(
+            (
+                enc_state,
+                policy,
+                value,
+                ownership_target,
+                ownership_weight,
+                win_target,
+                win_weight,
+                win_type_target,
+                win_type_weight
+            )
+        )
 
     return final_data, winner, move_count, win_type, territory_diff, actions
 
@@ -407,7 +522,9 @@ def _benchmark_async_selfplay(trainer, num_games=10, num_workers=None):
         use_liberty_features=trainer.use_liberty_features,
         liberty_bins=trainer.liberty_bins,
         use_last_moves=trainer.use_last_moves,
-        network_head=trainer.network_head
+        network_head=trainer.network_head,
+        cache_debug_samples=trainer.cache_debug_samples,
+        cache_max_entries=trainer.cache_max_entries
     )
     output_queues = [mp.Queue(maxsize=1000) for _ in range(num_workers)]
     server.output_queues = output_queues
@@ -490,11 +607,36 @@ def _benchmark_async_selfplay(trainer, num_games=10, num_workers=None):
         avg_batch = reqs / max(1, batches)
         avg_wait_ms = 1000 * wait_time / max(1, batches)
         wait_ratio = wait_time / max(1e-9, wait_time + infer_time)
+        cache_hits = stats.get("cache_hits", 0)
+        cache_misses = stats.get("cache_misses", 0)
+        cache_total = cache_hits + cache_misses
+        cache_hit_rate = cache_hits / max(1, cache_total)
+        cache_size = stats.get("cache_size", 0)
+        deduped = stats.get("deduped", 0)
+        unique_evals = stats.get("unique_evals", 0)
+        forward_calls = stats.get("forward_calls", unique_evals)
+        avg_eval_ms = 1000 * infer_time / max(1, unique_evals)
         print(
             f"    Benchmark: infer_reqs={reqs}, infer_time={infer_time:.2f}s, "
             f"wait_time={wait_time:.2f}s, avg_batch={avg_batch:.1f}, "
             f"avg_wait_ms={avg_wait_ms:.2f}, wait_ratio={wait_ratio:.2f}"
         )
+        print(
+            f"    Cache stats: hit_rate={cache_hit_rate:.2%}, hits={cache_hits}, misses={cache_misses}, "
+            f"cache_size={cache_size}, deduped={deduped}, avg_eval_ms={avg_eval_ms:.2f}"
+        )
+        print(
+            f"    Cache bypass: forward_calls={forward_calls}, "
+            f"cache_hits_bypassed={cache_hits}, unique_evals={unique_evals}"
+        )
+        debug_samples = stats.get("debug_samples", 0)
+        if debug_samples:
+            debug_policy_l1 = stats.get("debug_policy_l1")
+            debug_value_max = stats.get("debug_value_max")
+            print(
+                f"    Cache debug: samples={debug_samples}, "
+                f"policy_l1={debug_policy_l1:.6f}, value_max_diff={debug_value_max:.6f}"
+            )
     else:
         reqs = 0
         infer_time = 0.0
@@ -514,5 +656,14 @@ def _benchmark_async_selfplay(trainer, num_games=10, num_workers=None):
         "avg_batch_size": (reqs / max(1, batches)),
         "avg_wait_ms": (1000 * wait_time / max(1, batches)),
         "wait_ratio": (wait_time / max(1e-9, wait_time + infer_time)),
-        "batch_size": batch_size
+        "batch_size": batch_size,
+        "cache_hit_rate": (cache_hit_rate if stats else None),
+        "cache_size": (cache_size if stats else None),
+        "deduped": (deduped if stats else None),
+        "avg_eval_ms": (avg_eval_ms if stats else None),
+        "forward_calls": (forward_calls if stats else None),
+        "cache_hits_bypassed": (cache_hits if stats else None),
+        "debug_samples": (stats.get("debug_samples", 0) if stats else None),
+        "debug_policy_l1": (stats.get("debug_policy_l1") if stats else None),
+        "debug_value_max": (stats.get("debug_value_max") if stats else None)
     }

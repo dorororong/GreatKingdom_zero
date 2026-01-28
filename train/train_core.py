@@ -25,9 +25,9 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from env.env import GreatKingdomEnv
 from env.env_fast import GreatKingdomEnvFast
 from game_result import winner_id_from_step
-from network import AlphaZeroNetwork, encode_board_from_state, infer_head_type_from_state_dict
+from network import AlphaZeroNetwork, encode_board_from_state, infer_head_type_from_state_dict, load_state_dict_safe
 from mcts_alphazero import AlphaZeroMCTS
-from symmetry import augment_sample
+from symmetry import CANON_TRANSFORMS, _apply_transform_array, transform_action_probs
 from train.eval_utils import (
     _init_eval_worker,
     _eval_one_game,
@@ -250,15 +250,49 @@ def _save_selfplay_records(records, output_path, meta=None):
 class ReplayBuffer:
     """학습 데이터 저장소"""
     
-    def __init__(self, max_size=10000, default_ownership_weight=0.2):
+    def __init__(self, max_size=10000, default_ownership_weight=0.2, default_win_weight=0.0, default_win_type_weight=0.0, board_size=5):
         self.buffer = deque(maxlen=max_size)
         self.default_ownership_weight = float(default_ownership_weight)
+        self.default_win_weight = float(default_win_weight)
+        self.default_win_type_weight = float(default_win_type_weight)
+        self.board_size = int(board_size)
     
-    def push(self, state, policy, value, ownership, ownership_weight=None):
+    def push(
+        self,
+        state,
+        policy,
+        value,
+        ownership,
+        ownership_weight=None,
+        win_target=None,
+        win_weight=None,
+        win_type_target=None,
+        win_type_weight=None
+    ):
         """데이터 추가"""
         if ownership_weight is None:
             ownership_weight = self.default_ownership_weight
-        self.buffer.append((state, policy, value, ownership, float(ownership_weight)))
+        if win_target is None:
+            win_target = 0.5
+        if win_weight is None:
+            win_weight = self.default_win_weight
+        if win_type_target is None:
+            win_type_target = 0.5
+        if win_type_weight is None:
+            win_type_weight = self.default_win_type_weight
+        self.buffer.append(
+            (
+                state,
+                policy,
+                value,
+                ownership,
+                float(ownership_weight),
+                float(win_target),
+                float(win_weight),
+                float(win_type_target),
+                float(win_type_weight)
+            )
+        )
     
     def sample(self, batch_size):
         """랜덤 샘플링"""
@@ -268,23 +302,58 @@ class ReplayBuffer:
         values = []
         ownerships = []
         ownership_weights = []
+        win_targets = []
+        win_weights = []
+        win_type_targets = []
+        win_type_weights = []
         for item in batch:
             if len(item) == 4:
                 state, policy, value, ownership = item
-                weight = self.default_ownership_weight
+                ownership_weight = self.default_ownership_weight
+                win_target = 0.5
+                win_weight = self.default_win_weight
+                win_type_target = 0.5
+                win_type_weight = self.default_win_type_weight
+            elif len(item) == 5:
+                state, policy, value, ownership, ownership_weight = item
+                win_target = 0.5
+                win_weight = self.default_win_weight
+                win_type_target = 0.5
+                win_type_weight = self.default_win_type_weight
+            elif len(item) == 7:
+                state, policy, value, ownership, ownership_weight, win_target, win_weight = item
+                win_type_target = 0.5
+                win_type_weight = self.default_win_type_weight
             else:
-                state, policy, value, ownership, weight = item
-            states.append(state)
-            policies.append(policy)
+                state, policy, value, ownership, ownership_weight, win_target, win_weight, win_type_target, win_type_weight = item
+            transform = random.choice(CANON_TRANSFORMS)
+            t_state = _apply_transform_array(state, transform)
+            t_state = np.ascontiguousarray(t_state)
+            t_policy = transform_action_probs(policy, self.board_size, transform)
+            if ownership is not None:
+                t_owner = _apply_transform_array(ownership, transform)
+                t_owner = np.ascontiguousarray(t_owner)
+            else:
+                t_owner = ownership
+            states.append(t_state)
+            policies.append(t_policy)
             values.append(value)
-            ownerships.append(ownership)
-            ownership_weights.append(weight)
+            ownerships.append(t_owner)
+            ownership_weights.append(ownership_weight)
+            win_targets.append(win_target)
+            win_weights.append(win_weight)
+            win_type_targets.append(win_type_target)
+            win_type_weights.append(win_type_weight)
         return (
             np.array(states),
             np.array(policies),
             np.array(values, dtype=np.float32),
             np.array(ownerships, dtype=np.float32),
-            np.array(ownership_weights, dtype=np.float32)
+            np.array(ownership_weights, dtype=np.float32),
+            np.array(win_targets, dtype=np.float32),
+            np.array(win_weights, dtype=np.float32),
+            np.array(win_type_targets, dtype=np.float32),
+            np.array(win_type_weights, dtype=np.float32)
         )
     
     def __len__(self):
@@ -332,7 +401,12 @@ class AlphaZeroTrainer:
         freeze_backbone_blocks=None,
         freeze_backbone_input=True,
         ownership_loss_weight=0.2,
-        ownership_loss_weight_capture=0.1
+        ownership_loss_weight_capture=0.1,
+        win_loss_weight=0.1,
+        win_type_loss_weight=0.1,
+        train_buffer_min_factor=2.0,
+        cache_debug_samples=0,
+        cache_max_entries=50000
     ):
         self.board_size = board_size
         self.center_wall = center_wall
@@ -368,6 +442,11 @@ class AlphaZeroTrainer:
         self.freeze_backbone_input = freeze_backbone_input
         self.ownership_loss_weight = float(ownership_loss_weight)
         self.ownership_loss_weight_capture = float(ownership_loss_weight_capture)
+        self.win_loss_weight = float(win_loss_weight)
+        self.win_type_loss_weight = float(win_type_loss_weight)
+        self.cache_debug_samples = int(cache_debug_samples)
+        self.cache_max_entries = int(cache_max_entries)
+        self.train_buffer_min_factor = float(train_buffer_min_factor)
         self.lr = lr
         self.weight_decay = 1e-4
         
@@ -413,6 +492,9 @@ class AlphaZeroTrainer:
             liberty_bins=liberty_bins,
             use_last_moves=use_last_moves
         )
+        self.net_version = 0
+        if hasattr(self.mcts, "set_net_version"):
+            self.mcts.set_net_version(self.net_version)
         
         # Optimizer (exclude frozen params if any)
         trainable_params = [p for p in self.network.parameters() if p.requires_grad]
@@ -421,7 +503,8 @@ class AlphaZeroTrainer:
         # Replay Buffer
         self.replay_buffer = ReplayBuffer(
             max_size=buffer_size,
-            default_ownership_weight=self.ownership_loss_weight
+            default_ownership_weight=self.ownership_loss_weight,
+            board_size=self.board_size
         )
         
         # 학습 통계
@@ -509,6 +592,25 @@ class AlphaZeroTrainer:
             black = info.get("black_territory", 0) if isinstance(info, dict) else 0
             white = info.get("white_territory", 0) if isinstance(info, dict) else 0
             territory_diff = abs(int(black) - int(white))
+        if winner == 1:
+            win_target = 1.0
+            win_weight = 1.0
+        elif winner == 2:
+            win_target = 0.0
+            win_weight = 1.0
+        else:
+            win_target = 0.5
+            win_weight = 0.0
+
+        if win_type == "capture":
+            win_type_target = 1.0
+            win_type_weight = 1.0
+        elif win_type == "territory":
+            win_type_target = 0.0
+            win_type_weight = 1.0
+        else:
+            win_type_target = 0.5
+            win_type_weight = 0.0
         ownership_target = _get_ownership_target(self.env)
         ownership_weight = (
             self.ownership_loss_weight_capture
@@ -532,7 +634,19 @@ class AlphaZeroTrainer:
             else:
                 value = -1.0
             
-            final_data.append((enc_state, policy, value, ownership_target, ownership_weight))
+            final_data.append(
+                (
+                    enc_state,
+                    policy,
+                    value,
+                    ownership_target,
+                    ownership_weight,
+                    win_target,
+                    win_weight,
+                    win_type_target,
+                    win_type_weight
+                )
+            )
         
         return final_data, winner, move_count, win_type, territory_diff, actions
 
@@ -664,6 +778,25 @@ class AlphaZeroTrainer:
             if win_type == "capture"
             else self.ownership_loss_weight
         )
+        if winner == 1:
+            win_target = 1.0
+            win_weight = 1.0
+        elif winner == 2:
+            win_target = 0.0
+            win_weight = 1.0
+        else:
+            win_target = 0.5
+            win_weight = 0.0
+
+        if win_type == "capture":
+            win_type_target = 1.0
+            win_type_weight = 1.0
+        elif win_type == "territory":
+            win_type_target = 0.0
+            win_type_weight = 1.0
+        else:
+            win_type_target = 0.5
+            win_type_weight = 0.0
 
         final_data = []
         for enc_state, policy in game_data:
@@ -676,7 +809,19 @@ class AlphaZeroTrainer:
             else:
                 value = -1.0
 
-            final_data.append((enc_state, policy, value, ownership_target, ownership_weight))
+            final_data.append(
+                (
+                    enc_state,
+                    policy,
+                    value,
+                    ownership_target,
+                    ownership_weight,
+                    win_target,
+                    win_weight,
+                    win_type_target,
+                    win_type_weight
+                )
+            )
 
         return final_data, winner, move_count
 
@@ -709,11 +854,18 @@ class AlphaZeroTrainer:
             )
             
             # Replay Buffer에 추가
-            for state, policy, value, ownership, ownership_weight in game_data:
-                for t_state, t_policy, t_value, t_owner in augment_sample(
-                    state, policy, value, self.board_size, ownership
-                ):
-                    self.replay_buffer.push(t_state, t_policy, t_value, t_owner, ownership_weight)
+            for state, policy, value, ownership, ownership_weight, win_target, win_weight, win_type_target, win_type_weight in game_data:
+                self.replay_buffer.push(
+                    state,
+                    policy,
+                    value,
+                    ownership,
+                    ownership_weight,
+                    win_target,
+                    win_weight,
+                    win_type_target,
+                    win_type_weight
+                )
             
             total_moves += moves
             wins[winner] += 1
@@ -814,11 +966,18 @@ class AlphaZeroTrainer:
                     game_data, winner, moves, win_type, territory_diff, actions = future.result()
                     
                     # Replay Buffer에 추가
-                    for state, policy, value, ownership, ownership_weight in game_data:
-                        for t_state, t_policy, t_value, t_owner in augment_sample(
-                            state, policy, value, self.board_size, ownership
-                        ):
-                            self.replay_buffer.push(t_state, t_policy, t_value, t_owner, ownership_weight)
+                    for state, policy, value, ownership, ownership_weight, win_target, win_weight, win_type_target, win_type_weight in game_data:
+                        self.replay_buffer.push(
+                            state,
+                            policy,
+                            value,
+                            ownership,
+                            ownership_weight,
+                            win_target,
+                            win_weight,
+                            win_type_target,
+                            win_type_weight
+                        )
                     
                     total_moves += moves
                     wins[winner] += 1
@@ -882,7 +1041,9 @@ class AlphaZeroTrainer:
             use_liberty_features=self.use_liberty_features,
             liberty_bins=self.liberty_bins,
             use_last_moves=self.use_last_moves,
-            network_head=self.network_head
+            network_head=self.network_head,
+            cache_debug_samples=self.cache_debug_samples,
+            cache_max_entries=self.cache_max_entries
         )
 
         output_queues = [mp.Queue(maxsize=1000) for _ in range(num_workers)]
@@ -945,11 +1106,18 @@ class AlphaZeroTrainer:
 
         for _ in range(num_games):
             game_data, winner, moves, win_type, territory_diff, actions = result_queue.get()
-            for state, policy, value, ownership, ownership_weight in game_data:
-                for t_state, t_policy, t_value, t_owner in augment_sample(
-                    state, policy, value, self.board_size, ownership
-                ):
-                    self.replay_buffer.push(t_state, t_policy, t_value, t_owner, ownership_weight)
+            for state, policy, value, ownership, ownership_weight, win_target, win_weight, win_type_target, win_type_weight in game_data:
+                self.replay_buffer.push(
+                    state,
+                    policy,
+                    value,
+                    ownership,
+                    ownership_weight,
+                    win_target,
+                    win_weight,
+                    win_type_target,
+                    win_type_weight
+                )
 
             total_moves += moves
             wins[winner] += 1
@@ -1001,10 +1169,35 @@ class AlphaZeroTrainer:
                 avg_infer_ms = 1000 * stats["total_infer_time"] / max(1, stats["total_batches"])
                 avg_wait_ms = 1000 * stats.get("total_wait_time", 0.0) / max(1, stats["total_batches"])
                 wait_ratio = stats.get("total_wait_time", 0.0) / max(1e-9, stats.get("total_wait_time", 0.0) + stats.get("total_infer_time", 0.0))
+                cache_hits = stats.get("cache_hits", 0)
+                cache_misses = stats.get("cache_misses", 0)
+                cache_total = cache_hits + cache_misses
+                cache_hit_rate = cache_hits / max(1, cache_total)
+                cache_size = stats.get("cache_size", 0)
+                deduped = stats.get("deduped", 0)
+                unique_evals = stats.get("unique_evals", 0)
+                forward_calls = stats.get("forward_calls", unique_evals)
+                avg_eval_ms = 1000 * stats["total_infer_time"] / max(1, unique_evals)
                 print(
                     f"  Inference stats: batches={stats['total_batches']}, avg_batch={avg_batch:.1f}, "
                     f"avg_batch_infer_ms={avg_infer_ms:.2f}, avg_wait_ms={avg_wait_ms:.2f}, wait_ratio={wait_ratio:.2f}"
                 )
+                print(
+                    f"  Cache stats: hit_rate={cache_hit_rate:.2%}, hits={cache_hits}, misses={cache_misses}, "
+                    f"cache_size={cache_size}, deduped={deduped}, avg_eval_ms={avg_eval_ms:.2f}"
+                )
+                print(
+                    f"  Cache bypass: forward_calls={forward_calls}, "
+                    f"cache_hits_bypassed={cache_hits}, unique_evals={unique_evals}"
+                )
+                debug_samples = stats.get("debug_samples", 0)
+                if debug_samples:
+                    debug_policy_l1 = stats.get("debug_policy_l1")
+                    debug_value_max = stats.get("debug_value_max")
+                    print(
+                        f"  Cache debug: samples={debug_samples}, "
+                        f"policy_l1={debug_policy_l1:.6f}, value_max_diff={debug_value_max:.6f}"
+                    )
 
         detail_summary = _summarize_selfplay_results(detail_results)
         return {
@@ -1024,7 +1217,7 @@ class AlphaZeroTrainer:
             return None
         
         # 샘플링
-        states, policies, values, ownerships, ownership_weights = self.replay_buffer.sample(self.batch_size)
+        states, policies, values, ownerships, ownership_weights, win_targets, win_weights, win_type_targets, win_type_weights = self.replay_buffer.sample(self.batch_size)
         
         # Tensor 변환
         states_t = torch.FloatTensor(states).to(self.device)
@@ -1032,12 +1225,16 @@ class AlphaZeroTrainer:
         values_t = torch.FloatTensor(values).unsqueeze(1).to(self.device)
         ownerships_t = torch.FloatTensor(ownerships).to(self.device)
         ownership_weights_t = torch.FloatTensor(ownership_weights).to(self.device)
+        win_targets_t = torch.FloatTensor(win_targets).unsqueeze(1).to(self.device)
+        win_weights_t = torch.FloatTensor(win_weights).to(self.device)
+        win_type_targets_t = torch.FloatTensor(win_type_targets).unsqueeze(1).to(self.device)
+        win_type_weights_t = torch.FloatTensor(win_type_weights).to(self.device)
         
         # Forward
         self.network.train()
         if self.freeze_backbone:
             self._set_backbone_eval()
-        pred_policies, pred_values, pred_ownership = self.network(states_t)
+        pred_policies, pred_values, pred_ownership, pred_win, pred_win_type = self.network(states_t)
         
         # Loss 계산
         # Policy loss: Cross entropy (target은 확률 분포)
@@ -1053,8 +1250,20 @@ class AlphaZeroTrainer:
         ownership_loss_per_sample = ownership_loss_map.mean(dim=(1, 2, 3))
         ownership_loss = (ownership_loss_per_sample * ownership_weights_t).mean()
 
+        # Win prediction loss (Black win probability)
+        win_loss_map = F.binary_cross_entropy_with_logits(
+            pred_win, win_targets_t, reduction="none"
+        ).squeeze(1)
+        win_loss = (win_loss_map * win_weights_t).mean() * self.win_loss_weight
+
+        # Win type loss (capture vs territory)
+        win_type_loss_map = F.binary_cross_entropy_with_logits(
+            pred_win_type, win_type_targets_t, reduction="none"
+        ).squeeze(1)
+        win_type_loss = (win_type_loss_map * win_type_weights_t).mean() * self.win_type_loss_weight
+
         # Total loss
-        total_loss = policy_loss + value_loss + ownership_loss
+        total_loss = policy_loss + value_loss + ownership_loss + win_loss + win_type_loss
         
         # Backward
         self.optimizer.zero_grad()
@@ -1067,12 +1276,14 @@ class AlphaZeroTrainer:
             "policy_loss": policy_loss.item(),
             "value_loss": value_loss.item(),
             "ownership_loss": ownership_loss.item(),
+            "win_loss": win_loss.item(),
+            "win_type_loss": win_type_loss.item(),
             "total_loss": total_loss.item()
         }
     
     def train_epoch(self, num_batches=100):
         """여러 배치 학습"""
-        losses = {"policy": [], "value": [], "ownership": [], "total": []}
+        losses = {"policy": [], "value": [], "ownership": [], "win": [], "win_type": [], "total": []}
         
         for _ in range(num_batches):
             result = self.train_step_batch()
@@ -1080,6 +1291,8 @@ class AlphaZeroTrainer:
                 losses["policy"].append(result["policy_loss"])
                 losses["value"].append(result["value_loss"])
                 losses["ownership"].append(result["ownership_loss"])
+                losses["win"].append(result["win_loss"])
+                losses["win_type"].append(result["win_type_loss"])
                 losses["total"].append(result["total_loss"])
         
         if losses["total"]:
@@ -1087,6 +1300,8 @@ class AlphaZeroTrainer:
                 "policy_loss": np.mean(losses["policy"]),
                 "value_loss": np.mean(losses["value"]),
                 "ownership_loss": np.mean(losses["ownership"]),
+                "win_loss": np.mean(losses["win"]),
+                "win_type_loss": np.mean(losses["win_type"]),
                 "total_loss": np.mean(losses["total"]),
                 "num_batches": len(losses["total"])
             }
@@ -1375,7 +1590,7 @@ class AlphaZeroTrainer:
             use_last_moves=self.use_last_moves,
             head_type=opponent_head
         ).to(self.device)
-        opponent_network.load_state_dict(checkpoint["network"])
+        load_state_dict_safe(opponent_network, checkpoint["network"])
         opponent_network.eval()
 
         opponent_mcts = AlphaZeroMCTS(
@@ -1622,7 +1837,12 @@ def train_alphazero(
     selfplay_record_interval=0,
     selfplay_record_dir="logs/selfplay_records",
     ownership_loss_weight=0.2,
-    ownership_loss_weight_capture=0.1
+    ownership_loss_weight_capture=0.1,
+    win_loss_weight=0.1,
+    win_type_loss_weight=0.1,
+    cache_debug_samples=0,
+    cache_max_entries=50000,
+    train_buffer_min_factor=2.0
 ):
     """
     AlphaZero 학습 메인 루프
@@ -1668,6 +1888,8 @@ def train_alphazero(
         'policy_loss': [],
         'value_loss': [],
         'ownership_loss': [],
+        'win_loss': [],
+        'win_type_loss': [],
         'total_loss': [],
         'win_rate': [],
         'best_match_rate': [],
@@ -1721,7 +1943,12 @@ def train_alphazero(
         freeze_backbone_blocks=freeze_backbone_blocks,
         freeze_backbone_input=freeze_backbone_input,
         ownership_loss_weight=ownership_loss_weight,
-        ownership_loss_weight_capture=ownership_loss_weight_capture
+        ownership_loss_weight_capture=ownership_loss_weight_capture,
+        win_loss_weight=win_loss_weight,
+        win_type_loss_weight=win_type_loss_weight,
+        cache_debug_samples=cache_debug_samples,
+        cache_max_entries=cache_max_entries,
+        train_buffer_min_factor=train_buffer_min_factor
     )
     
     # 기존 체크포인트 로드 시도 (latest -> final -> best)
@@ -1750,6 +1977,8 @@ def train_alphazero(
             print(f"Loaded training history ({len(history['iterations'])} iterations)")
             history.setdefault('best_match_rate', [])
             history.setdefault('ownership_loss', [])
+            history.setdefault('win_loss', [])
+            history.setdefault('win_type_loss', [])
     
     best_win_rate = 0.0
     if history['win_rate'] and not fresh_start:
@@ -1845,14 +2074,26 @@ def train_alphazero(
         
         # === 2. Training ===
         print(f"\n[2] Training ({batches_per_iteration} batches)...")
-        start_time = time.time()
-        train_stats = trainer.train_epoch(num_batches=batches_per_iteration)
-        train_time = time.time() - start_time
+        min_factor = trainer.train_buffer_min_factor
+        min_required = int(max(0.0, min_factor) * trainer.batch_size * batches_per_iteration)
+        if min_factor > 0 and len(trainer.replay_buffer) < min_required:
+            print(
+                f"    Skipped: buffer size {len(trainer.replay_buffer)} < "
+                f"min required {min_required} (factor={min_factor:.2f})"
+            )
+            train_stats = None
+            train_time = 0.0
+        else:
+            start_time = time.time()
+            train_stats = trainer.train_epoch(num_batches=batches_per_iteration)
+            train_time = time.time() - start_time
         
         if train_stats:
             print(f"    Policy Loss: {train_stats['policy_loss']:.4f} | "
                   f"Value Loss: {train_stats['value_loss']:.4f} | "
                   f"Ownership Loss: {train_stats['ownership_loss']:.4f} | "
+                  f"Win Loss: {train_stats['win_loss']:.4f} | "
+                  f"WinType Loss: {train_stats['win_type_loss']:.4f} | "
                   f"Total: {train_stats['total_loss']:.4f}")
             print(f"    Batches: {train_stats['num_batches']} | Time: {train_time:.1f}s")
             
@@ -1860,6 +2101,8 @@ def train_alphazero(
             writer.add_scalar('Loss/policy', train_stats['policy_loss'], iteration)
             writer.add_scalar('Loss/value', train_stats['value_loss'], iteration)
             writer.add_scalar('Loss/ownership', train_stats['ownership_loss'], iteration)
+            writer.add_scalar('Loss/win', train_stats['win_loss'], iteration)
+            writer.add_scalar('Loss/win_type', train_stats['win_type_loss'], iteration)
             writer.add_scalar('Loss/total', train_stats['total_loss'], iteration)
             writer.add_scalar('Training/time_seconds', train_time, iteration)
             
@@ -1868,12 +2111,19 @@ def train_alphazero(
             history['policy_loss'].append(train_stats['policy_loss'])
             history['value_loss'].append(train_stats['value_loss'])
             history['ownership_loss'].append(train_stats['ownership_loss'])
+            history['win_loss'].append(train_stats['win_loss'])
+            history['win_type_loss'].append(train_stats['win_type_loss'])
             history['total_loss'].append(train_stats['total_loss'])
             history['avg_moves'].append(sp_stats['avg_moves'])
             history['buffer_size'].append(sp_stats['buffer_size'])
             history['black_wins'].append(sp_stats['black_wins'])
             history['white_wins'].append(sp_stats['white_wins'])
             history['draws'].append(sp_stats['draws'])
+
+            # Network updated -> bump version to invalidate eval cache
+            trainer.net_version += 1
+            if hasattr(trainer.mcts, "set_net_version"):
+                trainer.mcts.set_net_version(trainer.net_version)
         
         # === 3. Evaluation (save_interval마다 실행) ===
         if benchmark_interval and iteration % benchmark_interval == 0:
@@ -1887,6 +2137,22 @@ def train_alphazero(
             writer.add_scalar('Benchmark/avg_batch_size', bench["avg_batch_size"], iteration)
             writer.add_scalar('Benchmark/avg_wait_ms', bench["avg_wait_ms"], iteration)
             writer.add_scalar('Benchmark/wait_ratio', bench["wait_ratio"], iteration)
+            if bench.get("cache_hit_rate") is not None:
+                writer.add_scalar('Benchmark/cache_hit_rate', bench["cache_hit_rate"], iteration)
+            if bench.get("cache_size") is not None:
+                writer.add_scalar('Benchmark/cache_size', bench["cache_size"], iteration)
+            if bench.get("deduped") is not None:
+                writer.add_scalar('Benchmark/deduped', bench["deduped"], iteration)
+            if bench.get("avg_eval_ms") is not None:
+                writer.add_scalar('Benchmark/avg_eval_ms', bench["avg_eval_ms"], iteration)
+            if bench.get("forward_calls") is not None:
+                writer.add_scalar('Benchmark/forward_calls', bench["forward_calls"], iteration)
+            if bench.get("cache_hits_bypassed") is not None:
+                writer.add_scalar('Benchmark/cache_hits_bypassed', bench["cache_hits_bypassed"], iteration)
+            if bench.get("debug_policy_l1") is not None:
+                writer.add_scalar('Benchmark/cache_policy_l1', bench["debug_policy_l1"], iteration)
+            if bench.get("debug_value_max") is not None:
+                writer.add_scalar('Benchmark/cache_value_max', bench["debug_value_max"], iteration)
 
             os.makedirs("logs", exist_ok=True)
             bench_file = os.path.join("logs", "benchmark_async_selfplay.csv")

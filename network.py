@@ -91,13 +91,13 @@ class AlphaZeroNetwork(nn.Module):
         
         # === Policy / Value Head ===
         if self.head_type == "conv":
-            self.policy_conv = nn.Conv2d(num_channels, 1, kernel_size=1, bias=False)
+            self.policy_conv = nn.Conv2d(num_channels, 1, kernel_size=1, bias=True)
             self.policy_bn = nn.BatchNorm2d(1)
             self.pass_fc = nn.Linear(num_channels, 1)
 
             self.value_conv = nn.Conv2d(num_channels, 1, kernel_size=1, bias=False)
             self.value_bn = nn.BatchNorm2d(1)
-            self.value_fc1 = nn.Linear(1, 64)
+            self.value_fc1 = nn.Linear(num_channels, 64)
             self.value_fc2 = nn.Linear(64, 1)
         else:
             self.policy_conv = nn.Conv2d(num_channels, 2, kernel_size=1, bias=False)
@@ -112,6 +112,11 @@ class AlphaZeroNetwork(nn.Module):
         # === Ownership Head ===
         self.owner_conv = nn.Conv2d(num_channels, 2, kernel_size=1, bias=False)
         self.owner_bn = nn.BatchNorm2d(2)
+
+        # === Auxiliary Heads ===
+        # Win prediction (Black win probability) and win condition (capture vs territory)
+        self.win_fc = nn.Linear(num_channels, 1)
+        self.win_type_fc = nn.Linear(num_channels, 1)
     
     def forward(self, x):
         """
@@ -126,18 +131,16 @@ class AlphaZeroNetwork(nn.Module):
         for block in self.res_blocks:
             x = block(x)
         
+        pooled = x.mean(dim=(2, 3))
+
         # Policy / Value head
         if self.head_type == "conv":
-            policy = F.relu(self.policy_bn(self.policy_conv(x)))
-            policy = policy.flatten(1)
-            pooled = x.mean(dim=(2, 3))
+            policy_logits = self.policy_conv(x).flatten(1)
             pass_logit = self.pass_fc(pooled)
-            policy = torch.cat([policy, pass_logit], dim=1)
-            policy = F.log_softmax(policy, dim=1)
+            policy_logits = torch.cat([policy_logits, pass_logit], dim=1)
+            policy = F.log_softmax(policy_logits, dim=1)
 
-            value = F.relu(self.value_bn(self.value_conv(x)))
-            value = value.mean(dim=(2, 3))
-            value = F.relu(self.value_fc1(value))
+            value = F.relu(self.value_fc1(pooled))
             value = torch.tanh(self.value_fc2(value))
         else:
             policy = F.relu(self.policy_bn(self.policy_conv(x)))
@@ -153,7 +156,11 @@ class AlphaZeroNetwork(nn.Module):
         # Ownership head (logits)
         ownership = self.owner_bn(self.owner_conv(x))
 
-        return policy, value, ownership
+        # Auxiliary heads (logits)
+        win_logit = self.win_fc(pooled)
+        win_type_logit = self.win_type_fc(pooled)
+
+        return policy, value, ownership, win_logit, win_type_logit
     
     def predict(self, state_tensor):
         """
@@ -180,9 +187,9 @@ class AlphaZeroNetwork(nn.Module):
             
             if device.type == "cuda":
                 with torch.amp.autocast("cuda"):
-                    policy, value, _ = self.forward(state_tensor)
+                    policy, value, _, _, _ = self.forward(state_tensor)
             else:
-                policy, value, _ = self.forward(state_tensor)
+                policy, value, _, _, _ = self.forward(state_tensor)
             
             # log_softmax -> softmax
             policy = torch.exp(policy).float().squeeze(0).cpu().numpy()
@@ -213,9 +220,9 @@ class AlphaZeroNetwork(nn.Module):
 
             if device.type == "cuda":
                 with torch.amp.autocast("cuda"):
-                    policy, value, _ = self.forward(state_tensors)
+                    policy, value, _, _, _ = self.forward(state_tensors)
             else:
-                policy, value, _ = self.forward(state_tensors)
+                policy, value, _, _, _ = self.forward(state_tensors)
             policy = torch.exp(policy).float().cpu().numpy()
             value = value.squeeze(1).float().cpu().numpy()
 
@@ -489,6 +496,19 @@ def infer_head_type_from_state_dict(state_dict):
     return "fc"
 
 
+def load_state_dict_safe(model, state_dict):
+    model_state = model.state_dict()
+    filtered = {
+        k: v for k, v in state_dict.items()
+        if k in model_state and v.shape == model_state[k].shape
+    }
+    missing = len(model_state) - len(filtered)
+    unexpected = len(state_dict) - len(filtered)
+    model_state.update(filtered)
+    model.load_state_dict(model_state)
+    return missing, unexpected
+
+
 if __name__ == "__main__":
     # 테스트
     print("=== AlphaZero Network Test ===")
@@ -507,11 +527,13 @@ if __name__ == "__main__":
     test_input = torch.randn(batch_size, net.input_channels, 5, 5)
     
     # Forward pass
-    policy, value, ownership = net(test_input)
+    policy, value, ownership, win_logit, win_type_logit = net(test_input)
     print(f"\nInput shape: {test_input.shape}")
     print(f"Policy output shape: {policy.shape}")  # (batch, 26)
     print(f"Value output shape: {value.shape}")    # (batch, 1)
     print(f"Ownership output shape: {ownership.shape}")  # (batch, 2, board, board)
+    print(f"Win logit shape: {win_logit.shape}")  # (batch, 1)
+    print(f"Win type logit shape: {win_type_logit.shape}")  # (batch, 1)
     
     # Policy 확률 합 확인 (log_softmax이므로 exp 후 합이 1)
     policy_probs = torch.exp(policy)

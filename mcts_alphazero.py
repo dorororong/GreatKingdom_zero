@@ -12,6 +12,7 @@ import math
 import time
 from collections import OrderedDict
 from network import encode_board_from_state, encode_board_batch
+from symmetry import canonicalize_state, invert_action_probs
 
 
 class AlphaZeroNode:
@@ -102,16 +103,24 @@ class AlphaZeroMCTS:
         self._predict_cache = OrderedDict()
         self._predict_cache_hits = 0
         self._predict_cache_misses = 0
+        self._predict_cache_deduped = 0
         self._cache_max_size = cache_max_size
         self.use_legal_cache = True
         self._legal_cache = OrderedDict()
         self._legal_cache_max_size = legal_cache_max_size
+        self.net_version = 0
 
     def clear_cache(self):
         self._predict_cache.clear()
         self._predict_cache_hits = 0
         self._predict_cache_misses = 0
+        self._predict_cache_deduped = 0
         self._legal_cache.clear()
+
+    def set_net_version(self, net_version):
+        if int(net_version) != int(self.net_version):
+            self.net_version = int(net_version)
+            self.clear_cache()
 
     def _profile_reset(self):
         self._profile_time = {}
@@ -151,14 +160,18 @@ class AlphaZeroMCTS:
         lm0, _ = self._normalize_last_moves(last_moves)
         return (action, lm0 if lm0 != -1 else None)
 
-    def _cache_key(self, board, player, last_moves=None):
-        if not self.use_last_moves:
-            lm0, lm1 = (-1, -1)
-        else:
-            lm0, lm1 = self._normalize_last_moves(last_moves)
-        return (board.tobytes(), int(player), lm0, lm1)
+    def _cache_key(self, board, player, passes, last_moves=None):
+        canon_board, canon_last_moves, transform_id, key = canonicalize_state(
+            board,
+            player,
+            passes,
+            last_moves if self.use_last_moves else None,
+            self.env.board_size
+        )
+        cache_key = (self.net_version, key)
+        return cache_key, transform_id, canon_board, canon_last_moves
 
-    def _predict(self, board, player, last_moves=None):
+    def _predict(self, board, player, passes, last_moves=None):
         if not self.use_cache:
             t0 = time.perf_counter() if self._profile_active else None
             encoded = encode_board_from_state(
@@ -175,18 +188,22 @@ class AlphaZeroMCTS:
                 self._profile_add("network_predict", time.perf_counter() - t1)
             return result
 
-        key = self._cache_key(board, player, last_moves)
-        cached = self._predict_cache.get(key)
+        cache_key, transform_id, canon_board, canon_last_moves = self._cache_key(
+            board, player, passes, last_moves
+        )
+        cached = self._predict_cache.get(cache_key)
         if cached is not None:
             self._predict_cache_hits += 1
             if self._cache_max_size is not None:
-                self._predict_cache.move_to_end(key)
-            return cached
+                self._predict_cache.move_to_end(cache_key)
+            policy_canon, value = cached
+            policy = invert_action_probs(policy_canon, self.env.board_size, transform_id)
+            return policy, value
 
         self._predict_cache_misses += 1
         t0 = time.perf_counter() if self._profile_active else None
         encoded = encode_board_from_state(
-            board, player, self.env.board_size, last_moves,
+            canon_board, player, self.env.board_size, canon_last_moves,
             use_liberty_features=self.use_liberty_features,
             liberty_bins=self.liberty_bins,
             use_last_moves=self.use_last_moves
@@ -197,12 +214,14 @@ class AlphaZeroMCTS:
         result = self.network.predict(encoded)
         if t1 is not None:
             self._profile_add("network_predict", time.perf_counter() - t1)
-        self._predict_cache[key] = result
+        self._predict_cache[cache_key] = result
         if self._cache_max_size is not None and len(self._predict_cache) > self._cache_max_size:
             self._predict_cache.popitem(last=False)
-        return result
+        policy_canon, value = result
+        policy = invert_action_probs(policy_canon, self.env.board_size, transform_id)
+        return policy, value
 
-    def _predict_batch(self, boards, players, last_moves_list):
+    def _predict_batch(self, boards, players, passes_list, last_moves_list):
         results = [None] * len(boards)
         miss_indices = []
         miss_states = []
@@ -210,26 +229,49 @@ class AlphaZeroMCTS:
             last_moves_list = [None] * len(boards)
 
         if self.use_cache:
-            for i, (board, player, last_moves) in enumerate(zip(boards, players, last_moves_list)):
-                key = self._cache_key(board, player, last_moves)
-                cached = self._predict_cache.get(key)
+            for i, (board, player, passes, last_moves) in enumerate(zip(boards, players, passes_list, last_moves_list)):
+                cache_key, transform_id, canon_board, canon_last_moves = self._cache_key(
+                    board, player, passes, last_moves
+                )
+                cached = self._predict_cache.get(cache_key)
                 if cached is not None:
                     self._predict_cache_hits += 1
                     if self._cache_max_size is not None:
-                        self._predict_cache.move_to_end(key)
-                    results[i] = cached
+                        self._predict_cache.move_to_end(cache_key)
+                    policy_canon, value = cached
+                    policy = invert_action_probs(policy_canon, self.env.board_size, transform_id)
+                    results[i] = (policy, value)
                 else:
                     self._predict_cache_misses += 1
                     miss_indices.append(i)
-                    miss_states.append((board, player, last_moves))
+                    miss_states.append((i, board, player, passes, last_moves, transform_id, canon_board, canon_last_moves, cache_key))
         else:
             miss_indices = list(range(len(boards)))
-            miss_states = list(zip(boards, players, last_moves_list))
+            miss_states = list(zip(boards, players, passes_list, last_moves_list))
 
         if miss_indices:
-            boards_miss = [s[0] for s in miss_states]
-            players_miss = [s[1] for s in miss_states]
-            last_moves_miss = [s[2] for s in miss_states]
+            if self.use_cache:
+                unique = {}
+                for entry in miss_states:
+                    _, _, player, passes, last_moves, transform_id, canon_board, canon_last_moves, cache_key = entry
+                    if cache_key not in unique:
+                        unique[cache_key] = {
+                            "player": player,
+                            "passes": passes,
+                            "canon_board": canon_board,
+                            "canon_last_moves": canon_last_moves,
+                            "entries": []
+                        }
+                    unique[cache_key]["entries"].append(entry)
+                self._predict_cache_deduped += max(0, len(miss_states) - len(unique))
+                boards_miss = [v["canon_board"] for v in unique.values()]
+                players_miss = [v["player"] for v in unique.values()]
+                last_moves_miss = [v["canon_last_moves"] for v in unique.values()]
+                unique_keys = list(unique.keys())
+            else:
+                boards_miss = [s[0] for s in miss_states]
+                players_miss = [s[1] for s in miss_states]
+                last_moves_miss = [s[3] for s in miss_states]
             t0 = time.perf_counter() if self._profile_active else None
             encoded_batch = encode_board_batch(
                 boards_miss, players_miss, self.env.board_size, last_moves_miss,
@@ -258,14 +300,21 @@ class AlphaZeroMCTS:
                 policies = np.array(policies)
                 values = np.array(values)
 
-            for idx, policy, value in zip(miss_indices, policies, values):
-                results[idx] = (policy, float(value))
-                if self.use_cache:
-                    board, player, last_moves = boards[idx], players[idx], last_moves_list[idx]
-                    cache_key = self._cache_key(board, player, last_moves)
-                    self._predict_cache[cache_key] = results[idx]
+            if self.use_cache:
+                for key_idx, cache_key in enumerate(unique_keys):
+                    policy_canon = policies[key_idx]
+                    value = float(values[key_idx])
+                    self._predict_cache[cache_key] = (policy_canon, value)
                     if self._cache_max_size is not None and len(self._predict_cache) > self._cache_max_size:
                         self._predict_cache.popitem(last=False)
+                    for entry in unique[cache_key]["entries"]:
+                        idx = entry[0]
+                        transform_id = entry[5]
+                        policy = invert_action_probs(policy_canon, self.env.board_size, transform_id)
+                        results[idx] = (policy, value)
+            else:
+                for idx, policy, value in zip(miss_indices, policies, values):
+                    results[idx] = (policy, float(value))
 
         policies = np.array([r[0] for r in results])
         values = np.array([r[1] for r in results])
@@ -445,7 +494,7 @@ class AlphaZeroMCTS:
         
         # 신경망으로 policy와 value 예측
         if policy is None:
-            policy, _ = self._predict(board, player, last_moves)
+            policy, _ = self._predict(board, player, passes, last_moves)
         
         # 유효한 행동에 대해서만 prior 설정 (마스킹 후 재정규화)
         valid_policy = np.zeros_like(policy)
@@ -546,7 +595,7 @@ class AlphaZeroMCTS:
         # Value Network로 평가
         board, player, _, last_moves = self._unpack_state(current_state)
         t_pred = time.perf_counter() if self._profile_active else None
-        _, value = self._predict(board, player, last_moves)
+        _, value = self._predict(board, player, passes, last_moves)
         if t_pred is not None:
             self._profile_add("predict", time.perf_counter() - t_pred)
         
@@ -636,9 +685,10 @@ class AlphaZeroMCTS:
 
         boards = [item[1][0] for item in eval_items]
         players = [item[1][1] for item in eval_items]
+        passes_list = [item[1][2] for item in eval_items]
         last_moves_list = [item[1][3] if len(item[1]) > 3 else None for item in eval_items]
         t_pred = time.perf_counter() if self._profile_active else None
-        policies, values = self._predict_batch(boards, players, last_moves_list)
+        policies, values = self._predict_batch(boards, players, passes_list, last_moves_list)
         if t_pred is not None:
             self._profile_add("predict_batch", time.perf_counter() - t_pred)
 

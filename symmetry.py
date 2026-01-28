@@ -1,3 +1,5 @@
+import hashlib
+import struct
 import numpy as np
 from env.env import GreatKingdomEnv
 
@@ -12,11 +14,15 @@ TRANSFORMS = (
     "flip_diag_anti",
 )
 
+CANON_TRANSFORMS = ("identity",) + TRANSFORMS
+
 _ACTION_INDEX_MAP = {}
 
 
 def _apply_transform_array(arr, transform):
     """Apply a symmetry transform to a 2D board or 3D (C,H,W) tensor."""
+    if transform == "identity":
+        return arr.copy() if hasattr(arr, "copy") else arr
     if arr.ndim == 2:
         if transform == "rot90":
             return np.rot90(arr, k=-1)
@@ -51,6 +57,8 @@ def _apply_transform_array(arr, transform):
 
 
 def _transform_coord(r, c, n, transform):
+    if transform == "identity":
+        return r, c
     if transform == "rot90":
         return c, n - 1 - r
     if transform == "rot180":
@@ -76,7 +84,9 @@ def _get_action_index_map(board_size, transform):
 
     n = board_size
     rows, cols = np.indices((n, n))
-    if transform == "rot90":
+    if transform == "identity":
+        nr, nc = rows, cols
+    elif transform == "rot90":
         nr, nc = cols, n - 1 - rows
     elif transform == "rot180":
         nr, nc = n - 1 - rows, n - 1 - cols
@@ -97,6 +107,37 @@ def _get_action_index_map(board_size, transform):
     _ACTION_INDEX_MAP[key] = new_idx
     return new_idx
 
+
+_INVERSE_TRANSFORM = {
+    "identity": "identity",
+    "rot90": "rot270",
+    "rot180": "rot180",
+    "rot270": "rot90",
+    "flip_lr": "flip_lr",
+    "flip_ud": "flip_ud",
+    "flip_diag_main": "flip_diag_main",
+    "flip_diag_anti": "flip_diag_anti",
+}
+
+
+def inverse_transform(transform):
+    inv = _INVERSE_TRANSFORM.get(transform)
+    if inv is None:
+        raise ValueError(f"Unknown transform: {transform}")
+    return inv
+
+
+def transform_action_index(action, board_size, transform):
+    if action is None:
+        return None
+    pass_action = board_size * board_size
+    if action == pass_action:
+        return pass_action
+    if action < 0:
+        return action
+    new_idx = _get_action_index_map(board_size, transform)
+    return int(new_idx[int(action)])
+
 def transform_action_probs(action_probs, board_size, transform):
     """Transform action probabilities with the same symmetry as the board."""
     expected = board_size * board_size + 1
@@ -110,6 +151,80 @@ def transform_action_probs(action_probs, board_size, transform):
     new_idx = _get_action_index_map(board_size, transform)
     new_probs[new_idx] = action_probs[:pass_action]
     return new_probs
+
+
+def invert_action_probs(action_probs, board_size, transform):
+    inv = inverse_transform(transform)
+    return transform_action_probs(action_probs, board_size, inv)
+
+
+def _normalize_last_moves(last_moves):
+    if last_moves is None:
+        return (-1, -1)
+    if isinstance(last_moves, (list, tuple)):
+        lm0 = last_moves[0] if len(last_moves) > 0 else None
+        lm1 = last_moves[1] if len(last_moves) > 1 else None
+        return (int(lm0) if lm0 is not None else -1, int(lm1) if lm1 is not None else -1)
+    return (int(last_moves), -1)
+
+
+def _transform_last_moves(last_moves, board_size, transform):
+    lm0, lm1 = _normalize_last_moves(last_moves)
+    lm0_t = transform_action_index(lm0, board_size, transform) if lm0 >= 0 else lm0
+    lm1_t = transform_action_index(lm1, board_size, transform) if lm1 >= 0 else lm1
+    return (lm0_t, lm1_t)
+
+
+def transform_last_moves(last_moves, board_size, transform):
+    return _transform_last_moves(last_moves, board_size, transform)
+
+
+def canonicalize_state(board, player, passes, last_moves, board_size):
+    """Return canonical (board, last_moves) and transform id based on lexicographic key."""
+    best_key = None
+    best_board = None
+    best_last_moves = None
+    best_transform = "identity"
+
+    for transform in CANON_TRANSFORMS:
+        t_board = _apply_transform_array(board, transform)
+        t_last_moves = _transform_last_moves(last_moves, board_size, transform)
+        board_bytes = t_board.tobytes()
+        meta = struct.pack(
+            "<b b h h",
+            int(player),
+            int(passes),
+            int(t_last_moves[0]),
+            int(t_last_moves[1])
+        )
+        h = hashlib.blake2b(digest_size=32)
+        h.update(board_bytes)
+        h.update(meta)
+        key = h.digest()
+        if best_key is None or key < best_key:
+            best_key = key
+            best_board = t_board
+            best_last_moves = t_last_moves
+            best_transform = transform
+
+    return best_board, best_last_moves, best_transform, best_key
+
+
+def canonicalize_encoded_state(encoded_state):
+    """Canonicalize encoded (C,H,W) state for caching. Returns (state, transform, key)."""
+    best_key = None
+    best_state = None
+    best_transform = "identity"
+    for transform in CANON_TRANSFORMS:
+        t_state = _apply_transform_array(encoded_state, transform)
+        h = hashlib.blake2b(digest_size=32)
+        h.update(t_state.tobytes())
+        key = h.digest()
+        if best_key is None or key < best_key:
+            best_key = key
+            best_state = t_state
+            best_transform = transform
+    return best_state, best_transform, best_key
 
 
 def augment_sample(encoded_state, action_probs, value, board_size, ownership_target=None):
