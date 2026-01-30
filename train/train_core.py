@@ -34,6 +34,7 @@ from train.eval_utils import (
     _eval_worker_loop_random,
     _eval_worker_loop_mcts,
     _eval_worker_loop_best,
+    _eval_worker_loop_best_dual_async,
     _render_recorded_game
 )
 from train.selfplay_workers import (
@@ -127,6 +128,30 @@ def _summarize_eval_records(records):
             stats["other"] += 1
 
     return stats
+
+
+def _summarize_eval_timing(records):
+    timings = [r.get("timing") for r in records if isinstance(r, dict) and r.get("timing")]
+    if not timings:
+        return None
+    total_time = sum(t["total_time"] for t in timings)
+    mcts_time = sum(t.get("mcts_time", 0.0) for t in timings)
+    opp_time = sum(t.get("opponent_mcts_time", 0.0) for t in timings)
+    env_time = sum(t.get("env_time", 0.0) for t in timings)
+    moves = sum(t.get("moves", 0) for t in timings)
+    games = len(timings)
+    other = max(0.0, total_time - (mcts_time + opp_time + env_time))
+    return {
+        "games": games,
+        "total_time": total_time,
+        "per_game": total_time / max(1, games),
+        "mcts_time": mcts_time,
+        "opponent_time": opp_time,
+        "env_time": env_time,
+        "other_time": other,
+        "moves": moves,
+        "moves_per_game": moves / max(1, games)
+    }
 
 
 def _format_eval_stats(stats):
@@ -400,13 +425,18 @@ class AlphaZeroTrainer:
         freeze_backbone=False,
         freeze_backbone_blocks=None,
         freeze_backbone_input=True,
+        freeze_heads=False,
         ownership_loss_weight=0.2,
         ownership_loss_weight_capture=0.1,
         win_loss_weight=0.1,
         win_type_loss_weight=0.1,
         train_buffer_min_factor=2.0,
         cache_debug_samples=0,
-        cache_max_entries=50000
+        cache_max_entries=50000,
+        cache_enabled=True,
+        eval_cache_enabled=True,
+        eval_opponent_async=False,
+        eval_profile_timing=False
     ):
         self.board_size = board_size
         self.center_wall = center_wall
@@ -440,12 +470,17 @@ class AlphaZeroTrainer:
         self.freeze_backbone = freeze_backbone
         self.freeze_backbone_blocks = freeze_backbone_blocks
         self.freeze_backbone_input = freeze_backbone_input
+        self.freeze_heads = freeze_heads
         self.ownership_loss_weight = float(ownership_loss_weight)
         self.ownership_loss_weight_capture = float(ownership_loss_weight_capture)
         self.win_loss_weight = float(win_loss_weight)
         self.win_type_loss_weight = float(win_type_loss_weight)
         self.cache_debug_samples = int(cache_debug_samples)
         self.cache_max_entries = int(cache_max_entries)
+        self.cache_enabled = bool(cache_enabled)
+        self.eval_cache_enabled = bool(eval_cache_enabled)
+        self.eval_opponent_async = bool(eval_opponent_async)
+        self.eval_profile_timing = bool(eval_profile_timing)
         self.train_buffer_min_factor = float(train_buffer_min_factor)
         self.lr = lr
         self.weight_decay = 1e-4
@@ -472,7 +507,7 @@ class AlphaZeroTrainer:
             head_type=network_head
         ).to(self.device)
 
-        if self.freeze_backbone or self.freeze_backbone_blocks is not None or self.freeze_backbone_input:
+        if self.freeze_backbone or self.freeze_backbone_blocks is not None or self.freeze_backbone_input or self.freeze_heads:
             self._apply_freeze()
 
         # MCTS
@@ -670,6 +705,18 @@ class AlphaZeroTrainer:
                 for param in block.parameters():
                     param.requires_grad = False
 
+        if self.freeze_heads:
+            for name, param in self.network.named_parameters():
+                if (
+                    name.startswith("policy_")
+                    or name.startswith("value_")
+                    or name.startswith("owner_")
+                    or name.startswith("win_")
+                    or name.startswith("win_type_")
+                    or name.startswith("pass_fc.")
+                ):
+                    param.requires_grad = False
+
     def _set_backbone_eval(self):
         if self.freeze_backbone_input:
             self.network.bn_input.eval()
@@ -691,6 +738,11 @@ class AlphaZeroTrainer:
             self.freeze_backbone_input = freeze_input
         self.freeze_backbone_blocks = freeze_blocks
         self.freeze_backbone = False
+        self._apply_freeze()
+        self._rebuild_optimizer()
+
+    def set_freeze_heads(self, freeze_heads):
+        self.freeze_heads = bool(freeze_heads)
         self._apply_freeze()
         self._rebuild_optimizer()
 
@@ -910,7 +962,7 @@ class AlphaZeroTrainer:
     def _collect_self_play_multiprocess(self, num_games, verbose=True, temperature_schedule=None, record_interval=0, record_limit=None):
         """멀티프로세싱으로 자가 대전 데이터 수집"""
         # 워커 수 설정 (CPU 코어 수 - 2)
-        num_workers = max(1, mp.cpu_count() - 2)
+        num_workers = 11
         
         if verbose:
             print(f"  Using {num_workers} workers for parallel self-play...")
@@ -1024,7 +1076,7 @@ class AlphaZeroTrainer:
 
     def _collect_self_play_multiprocess_batched(self, num_games, verbose=True, temperature_schedule=None, record_interval=0, record_limit=None):
         """배치 추론 서버로 자가 대전 데이터 수집."""
-        num_workers = max(1, mp.cpu_count() - 2)
+        num_workers = 11
         if verbose:
             print(f"  Using {num_workers} workers with async inference...")
 
@@ -1043,7 +1095,8 @@ class AlphaZeroTrainer:
             use_last_moves=self.use_last_moves,
             network_head=self.network_head,
             cache_debug_samples=self.cache_debug_samples,
-            cache_max_entries=self.cache_max_entries
+            cache_max_entries=self.cache_max_entries,
+            cache_enabled=self.cache_enabled
         )
 
         output_queues = [mp.Queue(maxsize=1000) for _ in range(num_workers)]
@@ -1194,9 +1247,12 @@ class AlphaZeroTrainer:
                 if debug_samples:
                     debug_policy_l1 = stats.get("debug_policy_l1")
                     debug_value_max = stats.get("debug_value_max")
+                    debug_policy_l1_orig = stats.get("debug_policy_l1_orig")
+                    debug_value_max_orig = stats.get("debug_value_max_orig")
                     print(
                         f"  Cache debug: samples={debug_samples}, "
-                        f"policy_l1={debug_policy_l1:.6f}, value_max_diff={debug_value_max:.6f}"
+                        f"policy_l1={debug_policy_l1:.6f}, value_max_diff={debug_value_max:.6f}, "
+                        f"policy_l1_orig={debug_policy_l1_orig:.6f}, value_max_diff_orig={debug_value_max_orig:.6f}"
                     )
 
         detail_summary = _summarize_selfplay_results(detail_results)
@@ -1358,7 +1414,7 @@ class AlphaZeroTrainer:
         """멀티프로세싱으로 랜덤 플레이어 대비 평가."""
         self.network.eval()
         if num_workers is None:
-            num_workers = max(1, mp.cpu_count() - 2)
+            num_workers = 11
 
         network_state_dict = {k: v.cpu() for k, v in self.network.state_dict().items()}
         ai_players = [1 if i < num_games // 2 else 2 for i in range(num_games)]
@@ -1382,12 +1438,17 @@ class AlphaZeroTrainer:
                 self.use_last_moves,
                 self.mcts_eval_batch_size,
                 self.mcts_profile,
-                self.mcts_profile_every
+                self.mcts_profile_every,
+                self.eval_profile_timing
             )
         ) as executor:
             futures = [executor.submit(_eval_one_game, p) for p in ai_players]
             for future in as_completed(futures):
-                winner, ai_player = future.result()
+                result = future.result()
+                if len(result) == 3:
+                    winner, ai_player, _timing = result
+                else:
+                    winner, ai_player = result
                 if winner == "Black" and ai_player == 1:
                     wins += 1
                 elif winner == "White" and ai_player == 2:
@@ -1398,7 +1459,7 @@ class AlphaZeroTrainer:
     def evaluate_vs_random_async(self, num_games=20, num_workers=None):
         """Async inference 서버로 랜덤 대비 평가."""
         if num_workers is None:
-            num_workers = max(1, mp.cpu_count() - 2)
+            num_workers = 11
 
         network_state_dict = {k: v.cpu() for k, v in self.network.state_dict().items()}
         server = BatchInferenceServer(
@@ -1411,7 +1472,8 @@ class AlphaZeroTrainer:
             use_liberty_features=self.use_liberty_features,
             liberty_bins=self.liberty_bins,
             use_last_moves=self.use_last_moves,
-            network_head=self.network_head
+            network_head=self.network_head,
+            cache_enabled=self.eval_cache_enabled
         )
         output_queues = [mp.Queue(maxsize=1000) for _ in range(num_workers)]
         server.output_queues = output_queues
@@ -1447,7 +1509,8 @@ class AlphaZeroTrainer:
                     self.use_last_moves,
                     self.mcts_eval_batch_size,
                     self.mcts_profile,
-                    self.mcts_profile_every
+                    self.mcts_profile_every,
+                    self.eval_profile_timing
                 )
             )
             p.start()
@@ -1460,7 +1523,12 @@ class AlphaZeroTrainer:
         wins = 0
         game_records = []
         for _ in range(num_games):
-            winner, ai_player, moves, states, info, final_player = result_queue.get()
+            result = result_queue.get()
+            if len(result) == 7:
+                winner, ai_player, moves, states, info, final_player, timing = result
+            else:
+                winner, ai_player, moves, states, info, final_player = result
+                timing = None
             if winner == ai_player:
                 wins += 1
             game_records.append({
@@ -1469,7 +1537,8 @@ class AlphaZeroTrainer:
                 "moves": moves,
                 "states": states,
                 "info": info,
-                "final_player": final_player
+                "final_player": final_player,
+                "timing": timing
             })
 
         for _ in workers:
@@ -1485,7 +1554,7 @@ class AlphaZeroTrainer:
     def evaluate_vs_mcts_async(self, num_games=20, mcts_sims=100, num_workers=None):
         """Async inference 서버로 순수 MCTS 대비 평가."""
         if num_workers is None:
-            num_workers = max(1, mp.cpu_count() - 2)
+            num_workers = 11
 
         network_state_dict = {k: v.cpu() for k, v in self.network.state_dict().items()}
         server = BatchInferenceServer(
@@ -1498,7 +1567,8 @@ class AlphaZeroTrainer:
             use_liberty_features=self.use_liberty_features,
             liberty_bins=self.liberty_bins,
             use_last_moves=self.use_last_moves,
-            network_head=self.network_head
+            network_head=self.network_head,
+            cache_enabled=self.eval_cache_enabled
         )
         output_queues = [mp.Queue(maxsize=1000) for _ in range(num_workers)]
         server.output_queues = output_queues
@@ -1535,7 +1605,8 @@ class AlphaZeroTrainer:
                     self.use_last_moves,
                     self.mcts_eval_batch_size,
                     self.mcts_profile,
-                    self.mcts_profile_every
+                    self.mcts_profile_every,
+                    self.eval_profile_timing
                 )
             )
             p.start()
@@ -1548,7 +1619,12 @@ class AlphaZeroTrainer:
         wins = 0
         game_records = []
         for _ in range(num_games):
-            winner, ai_player, moves, states, info, final_player = result_queue.get()
+            result = result_queue.get()
+            if len(result) == 7:
+                winner, ai_player, moves, states, info, final_player, timing = result
+            else:
+                winner, ai_player, moves, states, info, final_player = result
+                timing = None
             if winner == ai_player:
                 wins += 1
             game_records.append({
@@ -1557,7 +1633,8 @@ class AlphaZeroTrainer:
                 "moves": moves,
                 "states": states,
                 "info": info,
-                "final_player": final_player
+                "final_player": final_player,
+                "timing": timing
             })
 
         for _ in workers:
@@ -1639,7 +1716,7 @@ class AlphaZeroTrainer:
         if not os.path.exists(checkpoint_path):
             return None, []
         if num_workers is None:
-            num_workers = max(1, mp.cpu_count() - 2)
+            num_workers = 11
 
         try:
             checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
@@ -1659,7 +1736,8 @@ class AlphaZeroTrainer:
             use_liberty_features=self.use_liberty_features,
             liberty_bins=self.liberty_bins,
             use_last_moves=self.use_last_moves,
-            network_head=self.network_head
+            network_head=self.network_head,
+            cache_enabled=self.eval_cache_enabled
         )
         output_queues = [mp.Queue(maxsize=1000) for _ in range(num_workers)]
         server.output_queues = output_queues
@@ -1667,38 +1745,91 @@ class AlphaZeroTrainer:
         server_process = mp.Process(target=server.run)
         server_process.start()
 
+        opponent_output_queues = None
+        opponent_server = None
+        opponent_process = None
+        if self.eval_opponent_async:
+            opponent_head = infer_head_type_from_state_dict(opponent_state_dict)
+            opponent_server = BatchInferenceServer(
+                network_state_dict=opponent_state_dict,
+                board_size=self.board_size,
+                num_res_blocks=self.num_res_blocks,
+                num_channels=self.num_channels,
+                batch_size=self.eval_infer_batch_size,
+                timeout=self.eval_infer_timeout,
+                use_liberty_features=self.use_liberty_features,
+                liberty_bins=self.liberty_bins,
+                use_last_moves=self.use_last_moves,
+                network_head=opponent_head,
+                cache_enabled=self.eval_cache_enabled
+            )
+            opponent_output_queues = [mp.Queue(maxsize=1000) for _ in range(num_workers)]
+            opponent_server.output_queues = opponent_output_queues
+            opponent_process = mp.Process(target=opponent_server.run)
+            opponent_process.start()
+
         game_queue = mp.Queue()
         result_queue = mp.Queue()
 
         workers = []
         for worker_id in range(num_workers):
-            p = mp.Process(
-                target=_eval_worker_loop_best,
-                args=(
-                    game_queue,
-                    result_queue,
-                    worker_id,
-                    server.input_queue,
-                    output_queues[worker_id],
-                    self.board_size,
-                    self.num_res_blocks,
-                    self.num_channels,
-                    self.num_simulations,
-                    self.c_puct,
-                    self.dirichlet_alpha,
-                    self.dirichlet_epsilon,
-                    opponent_state_dict,
-                    self.center_wall,
-                    self.komi,
-                    self.use_fast_env,
-                    self.use_liberty_features,
-                    self.liberty_bins,
-                    self.use_last_moves,
-                    self.mcts_eval_batch_size,
-                    self.mcts_profile,
-                    self.mcts_profile_every
+            if self.eval_opponent_async:
+                p = mp.Process(
+                    target=_eval_worker_loop_best_dual_async,
+                    args=(
+                        game_queue,
+                        result_queue,
+                        worker_id,
+                        server.input_queue,
+                        output_queues[worker_id],
+                        opponent_server.input_queue,
+                        opponent_output_queues[worker_id],
+                        self.board_size,
+                        self.num_simulations,
+                        self.c_puct,
+                        self.dirichlet_alpha,
+                        self.dirichlet_epsilon,
+                        self.center_wall,
+                        self.komi,
+                        self.use_fast_env,
+                        self.use_liberty_features,
+                        self.liberty_bins,
+                        self.use_last_moves,
+                        self.mcts_eval_batch_size,
+                        self.mcts_profile,
+                        self.mcts_profile_every,
+                        self.eval_profile_timing
+                    )
                 )
-            )
+            else:
+                p = mp.Process(
+                    target=_eval_worker_loop_best,
+                    args=(
+                        game_queue,
+                        result_queue,
+                        worker_id,
+                        server.input_queue,
+                        output_queues[worker_id],
+                        self.board_size,
+                        self.num_res_blocks,
+                        self.num_channels,
+                        self.num_simulations,
+                        self.c_puct,
+                        self.dirichlet_alpha,
+                        self.dirichlet_epsilon,
+                        opponent_state_dict,
+                        self.center_wall,
+                        self.komi,
+                        self.use_fast_env,
+                        self.use_liberty_features,
+                        self.liberty_bins,
+                        self.use_last_moves,
+                        self.mcts_eval_batch_size,
+                        self.mcts_profile,
+                        self.mcts_profile_every,
+                        self.eval_profile_timing
+                    )
+                )
             p.start()
             workers.append(p)
 
@@ -1709,7 +1840,12 @@ class AlphaZeroTrainer:
         wins = 0
         game_records = []
         for _ in range(num_games):
-            winner, ai_player, moves, states, info, final_player = result_queue.get()
+            result = result_queue.get()
+            if len(result) == 7:
+                winner, ai_player, moves, states, info, final_player, timing = result
+            else:
+                winner, ai_player, moves, states, info, final_player = result
+                timing = None
             if winner == ai_player:
                 wins += 1
             game_records.append({
@@ -1718,7 +1854,8 @@ class AlphaZeroTrainer:
                 "moves": moves,
                 "states": states,
                 "info": info,
-                "final_player": final_player
+                "final_player": final_player,
+                "timing": timing
             })
 
         for _ in workers:
@@ -1728,6 +1865,9 @@ class AlphaZeroTrainer:
 
         server.input_queue.put(None)
         server_process.join()
+        if self.eval_opponent_async and opponent_server is not None:
+            opponent_server.input_queue.put(None)
+            opponent_process.join()
 
         return wins / num_games, game_records
     
@@ -1831,9 +1971,11 @@ def train_alphazero(
     freeze_backbone=False,
     freeze_backbone_blocks=None,
     freeze_backbone_input=True,
+    freeze_heads=False,
     init_checkpoint=None,
     benchmark_interval=10,
     freeze_schedule=None,
+    freeze_head_schedule=None,
     selfplay_record_interval=0,
     selfplay_record_dir="logs/selfplay_records",
     ownership_loss_weight=0.2,
@@ -1842,7 +1984,11 @@ def train_alphazero(
     win_type_loss_weight=0.1,
     cache_debug_samples=0,
     cache_max_entries=50000,
-    train_buffer_min_factor=2.0
+    train_buffer_min_factor=2.0,
+    cache_enabled=True,
+    eval_cache_enabled=True,
+    eval_opponent_async=False,
+    eval_profile_timing=False
 ):
     """
     AlphaZero 학습 메인 루프
@@ -1942,13 +2088,18 @@ def train_alphazero(
         freeze_backbone=freeze_backbone,
         freeze_backbone_blocks=freeze_backbone_blocks,
         freeze_backbone_input=freeze_backbone_input,
+        freeze_heads=freeze_heads,
         ownership_loss_weight=ownership_loss_weight,
         ownership_loss_weight_capture=ownership_loss_weight_capture,
         win_loss_weight=win_loss_weight,
         win_type_loss_weight=win_type_loss_weight,
         cache_debug_samples=cache_debug_samples,
         cache_max_entries=cache_max_entries,
-        train_buffer_min_factor=train_buffer_min_factor
+        train_buffer_min_factor=train_buffer_min_factor,
+        cache_enabled=cache_enabled,
+        eval_cache_enabled=eval_cache_enabled,
+        eval_opponent_async=eval_opponent_async,
+        eval_profile_timing=eval_profile_timing
     )
     
     # 기존 체크포인트 로드 시도 (latest -> final -> best)
@@ -2013,6 +2164,31 @@ def train_alphazero(
             return None
         return value
 
+    def _resolve_flag_schedule(schedule, step):
+        if not schedule:
+            return None
+        try:
+            keys = sorted(int(k) for k in schedule.keys())
+        except Exception:
+            return None
+        chosen = None
+        for k in keys:
+            if step >= k:
+                chosen = k
+        if chosen is None:
+            return None
+        value = schedule.get(chosen, schedule.get(str(chosen)))
+        if value is None:
+            return None
+        if isinstance(value, str):
+            v = value.lower()
+            if v in ("true", "1", "yes", "y", "on", "freeze"):
+                return True
+            if v in ("false", "0", "no", "n", "off", "unfreeze", "none"):
+                return False
+            return None
+        return bool(value)
+
     for iteration in range(start_iteration + 1, num_iterations + 1):
         print(f"\n{'='*60}")
         print(f"Iteration {iteration}/{num_iterations}")
@@ -2023,6 +2199,11 @@ def train_alphazero(
             if target_blocks is not None and target_blocks != trainer.freeze_backbone_blocks:
                 trainer.set_freeze_backbone_blocks(target_blocks, freeze_input=freeze_backbone_input)
                 print(f"    Freeze schedule applied: blocks={target_blocks}, input={freeze_backbone_input}")
+        if freeze_head_schedule:
+            target_heads = _resolve_flag_schedule(freeze_head_schedule, iteration)
+            if target_heads is not None and target_heads != trainer.freeze_heads:
+                trainer.set_freeze_heads(target_heads)
+                print(f"    Freeze head schedule applied: heads_frozen={target_heads}")
         
         # === 1. Self-Play ===
         print(f"\n[1] Self-Play ({games_per_iteration} games)...")
@@ -2153,6 +2334,10 @@ def train_alphazero(
                 writer.add_scalar('Benchmark/cache_policy_l1', bench["debug_policy_l1"], iteration)
             if bench.get("debug_value_max") is not None:
                 writer.add_scalar('Benchmark/cache_value_max', bench["debug_value_max"], iteration)
+            if bench.get("debug_policy_l1_orig") is not None:
+                writer.add_scalar('Benchmark/cache_policy_l1_orig', bench["debug_policy_l1_orig"], iteration)
+            if bench.get("debug_value_max_orig") is not None:
+                writer.add_scalar('Benchmark/cache_value_max_orig', bench["debug_value_max_orig"], iteration)
 
             os.makedirs("logs", exist_ok=True)
             bench_file = os.path.join("logs", "benchmark_async_selfplay.csv")
@@ -2200,6 +2385,18 @@ def train_alphazero(
                     print(f"    Detailed results vs MCTS {sims}:")
                     for line in _format_eval_stats(eval_stats):
                         print(f"      {line}")
+                    if trainer.eval_profile_timing:
+                        timing_stats = _summarize_eval_timing(eval_records)
+                        if timing_stats:
+                            print("    Eval timing (avg per game):")
+                            print(
+                                f"      total={timing_stats['per_game']:.3f}s | "
+                                f"mcts={timing_stats['mcts_time']/timing_stats['games']:.3f}s | "
+                                f"opp={timing_stats['opponent_time']/timing_stats['games']:.3f}s | "
+                                f"env={timing_stats['env_time']/timing_stats['games']:.3f}s | "
+                                f"other={timing_stats['other_time']/timing_stats['games']:.3f}s | "
+                                f"moves={timing_stats['moves_per_game']:.1f}"
+                            )
                     print("    Rendering first evaluation game (vs MCTS)...")
                     _render_recorded_game(eval_records[0], board_size, center_wall)
                 if win_rate >= 0.9:
@@ -2230,6 +2427,18 @@ def train_alphazero(
                         print("    Detailed results vs Best:")
                         for line in _format_eval_stats(best_stats):
                             print(f"      {line}")
+                        if trainer.eval_profile_timing:
+                            timing_stats = _summarize_eval_timing(best_records)
+                            if timing_stats:
+                                print("    Eval timing vs Best (avg per game):")
+                                print(
+                                    f"      total={timing_stats['per_game']:.3f}s | "
+                                    f"mcts={timing_stats['mcts_time']/timing_stats['games']:.3f}s | "
+                                    f"opp={timing_stats['opponent_time']/timing_stats['games']:.3f}s | "
+                                    f"env={timing_stats['env_time']/timing_stats['games']:.3f}s | "
+                                    f"other={timing_stats['other_time']/timing_stats['games']:.3f}s | "
+                                    f"moves={timing_stats['moves_per_game']:.1f}"
+                                )
                         print("    Rendering first evaluation game (vs Best)...")
                         _render_recorded_game(best_records[0], board_size, center_wall)
                     history['best_match_rate'].append(best_match_rate)
@@ -2247,9 +2456,17 @@ def train_alphazero(
             # 텍스트 로그 파일에 기록
             with open(log_file, 'a', encoding='utf-8') as f:
                 win_rate_pct = last_win_rate * 100 if last_win_rate is not None else 0.0
+                if train_stats:
+                    loss_str = f"{train_stats['total_loss']:.4f}"
+                    policy_str = f"{train_stats['policy_loss']:.4f}"
+                    value_str = f"{train_stats['value_loss']:.4f}"
+                else:
+                    loss_str = "N/A"
+                    policy_str = "N/A"
+                    value_str = "N/A"
                 f.write(f"[Iter {iteration}] "
-                        f"Loss: {train_stats['total_loss']:.4f} "
-                        f"(P:{train_stats['policy_loss']:.4f}, V:{train_stats['value_loss']:.4f}) | "
+                        f"Loss: {loss_str} "
+                        f"(P:{policy_str}, V:{value_str}) | "
                         f"WinRate: {win_rate_pct:.1f}% | "
                         f"AvgMoves: {sp_stats['avg_moves']:.1f} | "
                         f"Buffer: {sp_stats['buffer_size']}\n")

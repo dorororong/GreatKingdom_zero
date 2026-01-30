@@ -400,7 +400,7 @@ def main():
     parser.add_argument("--center-wall", action="store_true", default=True)
     parser.add_argument("--komi", type=float, default=None)
     parser.add_argument("--use-fast-env", action="store_true", default=False)
-    parser.add_argument("--num-workers", type=int, default=max(1, mp.cpu_count() - 2))
+    parser.add_argument("--num-workers", type=int, default=11)
     parser.add_argument("--num-simulations", type=int, default=300)
     parser.add_argument("--c-puct", type=float, default=2.0)
     parser.add_argument("--dirichlet-alpha", type=float, default=0.3)

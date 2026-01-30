@@ -7,7 +7,13 @@ from env.env import GreatKingdomEnv
 from env.env_fast import GreatKingdomEnvFast
 from mcts import MCTS
 from mcts_fast import MCTS as MCTSFast
-from network import AlphaZeroNetwork, infer_head_type_from_state_dict, load_state_dict_safe, encode_board_from_state
+from network import AlphaZeroNetwork, infer_head_type_from_state_dict, load_state_dict_safe, encode_board_from_state, get_input_channels
+
+try:
+    from train.config import list_profiles, get_profile
+    _CONFIG_AVAILABLE = True
+except Exception:
+    _CONFIG_AVAILABLE = False
 from mcts_alphazero import AlphaZeroMCTS
 
 # 색상 정의
@@ -23,10 +29,14 @@ TERRITORY_BLACK = (0, 0, 0, 100)  # 투명도 포함
 TERRITORY_WHITE = (255, 255, 255, 100)
 
 class GreatKingdomGUI:
-    def __init__(self, board_size=5, cell_size=80, ai_type='mcts', mcts_simulations=1000, 
+    def __init__(self, board_size=5, cell_size=80, ai_type='mcts', mcts_simulations=1000,
                  alphazero_simulations=100, checkpoint_path="checkpoints/alphazero_latest.pt",
                  center_wall=True, komi=0, alphazero_black=True, use_fast_env=False,
-                 spectate_mode="az_vs_mcts", checkpoint_path_b=None):
+                 spectate_mode="az_vs_mcts", checkpoint_path_b=None,
+                 az_use_last_moves_override=None, az_use_liberty_features_override=None,
+                 az_liberty_bins_override=None, az_use_last_moves_override_b=None,
+                 az_use_liberty_features_override_b=None, az_liberty_bins_override_b=None,
+                 debug_model=False):
         pygame.init()
         self.board_size = board_size
         self.cell_size = cell_size
@@ -72,14 +82,21 @@ class GreatKingdomGUI:
         self.last_human_action = None  # 사람의 마지막 수 기록 (AI에게 전달)
         self.last_ai_action = None  # AI의 마지막 수 기록 (관전 모드용)
         self.last_moves = (None, None)
-        self.az_use_last_moves = False
+        self.az_use_last_moves = True
         self.az_use_liberty_features = True
         self.az_liberty_bins = 2
         self.az_label = "AlphaZero"
-        self.azb_use_last_moves = False
+        self.azb_use_last_moves = True
         self.azb_use_liberty_features = True
         self.azb_liberty_bins = 2
         self.az_label_b = "AlphaZeroB"
+        self.az_use_last_moves_override = az_use_last_moves_override
+        self.az_use_liberty_features_override = az_use_liberty_features_override
+        self.az_liberty_bins_override = az_liberty_bins_override
+        self.az_use_last_moves_override_b = az_use_last_moves_override_b
+        self.az_use_liberty_features_override_b = az_use_liberty_features_override_b
+        self.az_liberty_bins_override_b = az_liberty_bins_override_b
+        self.debug_model = bool(debug_model)
         self.human_player = None  # 1=흑, 2=백 (None이면 색상 선택 화면)
         self.game_started = False  # game started flag
         self._aux_cache_key = None
@@ -154,7 +171,8 @@ class GreatKingdomGUI:
         else:  # human
             print("Mode: Human vs Human")
     
-    def _load_alphazero_model(self, checkpoint_path):
+    def _load_alphazero_model(self, checkpoint_path, use_last_moves_override=None,
+                              use_liberty_features_override=None, liberty_bins_override=None):
         if not checkpoint_path or not os.path.exists(checkpoint_path):
             print(f"Warning: Checkpoint not found: {checkpoint_path}")
             return None
@@ -207,6 +225,27 @@ class GreatKingdomGUI:
             else:
                 raise RuntimeError(f"Unsupported input channels in checkpoint: {in_channels}")
 
+        if use_liberty_features_override is not None:
+            use_liberty_features = bool(use_liberty_features_override)
+        if liberty_bins_override is not None:
+            liberty_bins = int(liberty_bins_override)
+        if use_last_moves_override is not None:
+            use_last_moves = bool(use_last_moves_override)
+
+        conv_weight = checkpoint['network'].get('conv_input.weight')
+        if conv_weight is not None:
+            expected_channels = get_input_channels(
+                use_liberty_features=use_liberty_features,
+                liberty_bins=liberty_bins,
+                use_last_moves=use_last_moves
+            )
+            actual_channels = int(conv_weight.shape[1])
+            if expected_channels != actual_channels:
+                print(
+                    "Warning: feature override mismatch. "
+                    f"expected_in_channels={expected_channels}, checkpoint_in_channels={actual_channels}"
+                )
+
         print(
             f"Network config: num_res_blocks={num_res_blocks}, num_channels={num_channels}, "
             f"use_liberty_features={use_liberty_features}, liberty_bins={liberty_bins}, "
@@ -222,8 +261,13 @@ class GreatKingdomGUI:
             use_last_moves=use_last_moves,
             head_type=head_type
         )
-        load_state_dict_safe(network, checkpoint['network'])
+        missing, unexpected = load_state_dict_safe(network, checkpoint['network'])
         network.eval()
+        if self.debug_model:
+            print(
+                f"Loaded state dict: missing={missing}, unexpected={unexpected} "
+                f"(checkpoint={checkpoint_path})"
+            )
 
         mcts = AlphaZeroMCTS(
             network,
@@ -249,7 +293,12 @@ class GreatKingdomGUI:
     def _load_alphazero(self):
         """AlphaZero model load."""
         mcts_cls = MCTSFast if self.use_fast_env else MCTS
-        model = self._load_alphazero_model(self.checkpoint_path)
+        model = self._load_alphazero_model(
+            self.checkpoint_path,
+            use_last_moves_override=self.az_use_last_moves_override,
+            use_liberty_features_override=self.az_use_liberty_features_override,
+            liberty_bins_override=self.az_liberty_bins_override
+        )
         if model is None:
             print("Falling back to MCTS")
             self.ai_type = 'mcts'
@@ -270,7 +319,12 @@ class GreatKingdomGUI:
             print(f"  Total games: {model['checkpoint']['total_games']}")
 
         if self.ai_type == 'spectate' and self.spectate_mode == "az_vs_az":
-            model_b = self._load_alphazero_model(self.checkpoint_path_b)
+            model_b = self._load_alphazero_model(
+                self.checkpoint_path_b,
+                use_last_moves_override=self.az_use_last_moves_override_b,
+                use_liberty_features_override=self.az_use_liberty_features_override_b,
+                liberty_bins_override=self.az_liberty_bins_override_b
+            )
             if model_b is None:
                 print("Spectate az_vs_az requested but second checkpoint missing. Falling back to az_vs_mcts.")
                 self.spectate_mode = "az_vs_mcts"
@@ -309,6 +363,8 @@ class GreatKingdomGUI:
     def _get_ownership_probs(self):
         active = self._get_active_az_model()
         if active is None:
+            if self.debug_model:
+                print("Ownership heads unavailable: AlphaZero model not loaded.")
             return None, None, None, None
         network, use_last_moves, use_liberty_features, liberty_bins = active
         state = self._make_state(use_last_moves)
@@ -876,29 +932,61 @@ if __name__ == "__main__":
     parser.add_argument('--ai', type=str, default='alphazero',
                         choices=['alphazero', 'mcts', 'human', 'spectate'],
                         help='AI 타입: alphazero, mcts, human (2인 대전), spectate (AI vs AI 관전)')
-    parser.add_argument('--checkpoint', type=str, default='checkpoints/board_7/center_wall_on/alphazero_latest.pt',
+    parser.add_argument('--checkpoint', type=str, default='checkpoints/board_9/center_wall_on/b8c96/alphazero_latest.pt',
                         help='AlphaZero ???????????')
-    parser.add_argument('--checkpoint_b', type=str, default='',
+    parser.add_argument('--checkpoint_b', type=str, default='checkpoints/board_7/center_wall_on/b5c96/alphazero_latest.pt',
                         help='Second AlphaZero checkpoint for az_vs_az spectate')
-    parser.add_argument('--spectate_mode', type=str, default='az_vs_mcts',
+    parser.add_argument('--spectate_mode', type=str, default='az_vs_az',
                         choices=['az_vs_mcts', 'az_vs_az'],
                         help='Spectate mode: az_vs_mcts or az_vs_az')
     parser.add_argument('--fast_env', type=str, default='auto',
                         help='Fast env/mcts ???? (True/False/auto)')
     parser.add_argument('--mcts_sims', type=int, default=200,
                         help='Pure MCTS 시뮬레이션 횟수')
-    parser.add_argument('--alphazero_sims', type=int, default=600,
+    parser.add_argument('--alphazero_sims', type=int, default=500,
                         help='AlphaZero MCTS 시뮬레이션 횟수')
-    parser.add_argument('--board_size', type=int, default=7,
+    parser.add_argument('--board_size', type=int, default=9,
                         help='보드 크기')
+    parser.add_argument('--profile', type=str, default='auto',
+                        help='Use training config profile (name or auto)')
     parser.add_argument('--center_wall', type=str, default='auto',
                         help='center wall setting (True/False/auto)')
     parser.add_argument('--komi', type=str, default='auto',
                         help='komi setting (number/auto)')
     parser.add_argument('--alphazero_black', type=str, default='True',
                         help='관전 모드에서 AlphaZero가 흑을 잡을지 여부 (True/False/auto). False면 MCTS가 흑')
+    parser.add_argument('--az_use_last_moves', type=str, default='auto',
+                        help='AlphaZero feature override: last moves (true/false/auto)')
+    parser.add_argument('--az_use_liberty_features', type=str, default='auto',
+                        help='AlphaZero feature override: liberty features (true/false/auto)')
+    parser.add_argument('--az_liberty_bins', type=str, default='auto',
+                        help='AlphaZero feature override: liberty bins (int/auto)')
+    parser.add_argument('--az_use_last_moves_b', type=str, default='auto',
+                        help='Second AlphaZero override: last moves (true/false/auto)')
+    parser.add_argument('--az_use_liberty_features_b', type=str, default='auto',
+                        help='Second AlphaZero override: liberty features (true/false/auto)')
+    parser.add_argument('--az_liberty_bins_b', type=str, default='auto',
+                        help='Second AlphaZero override: liberty bins (int/auto)')
+    parser.add_argument('--debug_model', action='store_true',
+                        help='Print extra model load and aux head diagnostics')
     
     args = parser.parse_args()
+
+    def _parse_bool_auto(value):
+        v = value.lower()
+        if v == 'auto':
+            return None
+        if v in ('true', '1', 'yes', 'y'):
+            return True
+        if v in ('false', '0', 'no', 'n'):
+            return False
+        raise ValueError(f"Invalid boolean value: {value}")
+
+    def _parse_int_auto(value):
+        v = value.lower()
+        if v == 'auto':
+            return None
+        return int(value)
     
     center_wall_arg = args.center_wall.lower()
     if center_wall_arg == 'auto':
@@ -935,6 +1023,62 @@ if __name__ == "__main__":
     else:
         komi = float(args.komi)
 
+    az_use_last_moves = _parse_bool_auto(args.az_use_last_moves)
+    az_use_liberty_features = _parse_bool_auto(args.az_use_liberty_features)
+    az_liberty_bins = _parse_int_auto(args.az_liberty_bins)
+    az_use_last_moves_b = _parse_bool_auto(args.az_use_last_moves_b)
+    az_use_liberty_features_b = _parse_bool_auto(args.az_use_liberty_features_b)
+    az_liberty_bins_b = _parse_int_auto(args.az_liberty_bins_b)
+
+    profile = None
+    profile_name = None
+    if _CONFIG_AVAILABLE:
+        if args.profile and args.profile.lower() != 'auto':
+            try:
+                profile = get_profile(args.profile)
+                profile_name = args.profile
+            except Exception as e:
+                print(f"Warning: failed to load profile '{args.profile}': {e}")
+        elif args.profile and args.profile.lower() == 'auto':
+            candidates = []
+            for name in list_profiles():
+                try:
+                    p = get_profile(name)
+                except Exception:
+                    continue
+                if p.get('board_size') == args.board_size and p.get('center_wall') == center_wall:
+                    candidates.append(name)
+            if len(candidates) == 1:
+                profile_name = candidates[0]
+                profile = get_profile(profile_name)
+            elif len(candidates) > 1:
+                print(f"Warning: multiple profiles match board/center_wall: {candidates}.")
+    else:
+        if args.profile and args.profile.lower() != 'auto':
+            print("Warning: train.config not available; ignoring --profile.")
+
+    if profile:
+        print(f"Using profile: {profile_name}")
+        if profile.get('board_size') is not None and profile.get('board_size') != args.board_size:
+            print(
+                f"Warning: profile board_size={profile.get('board_size')} "
+                f"!= args.board_size={args.board_size}"
+            )
+        if komi_arg == 'auto' and profile.get('komi') is not None:
+            komi = profile['komi']
+        if az_use_last_moves is None and profile.get('use_last_moves') is not None:
+            az_use_last_moves = profile.get('use_last_moves')
+        if az_use_liberty_features is None and profile.get('use_liberty_features') is not None:
+            az_use_liberty_features = profile.get('use_liberty_features')
+        if az_liberty_bins is None and profile.get('liberty_bins') is not None:
+            az_liberty_bins = profile.get('liberty_bins')
+        if az_use_last_moves_b is None:
+            az_use_last_moves_b = az_use_last_moves
+        if az_use_liberty_features_b is None:
+            az_use_liberty_features_b = az_use_liberty_features
+        if az_liberty_bins_b is None:
+            az_liberty_bins_b = az_liberty_bins
+
     game = GreatKingdomGUI(
         board_size=args.board_size,
         ai_type=args.ai,
@@ -946,6 +1090,13 @@ if __name__ == "__main__":
         komi=komi,
         alphazero_black=args.alphazero_black.lower() == 'true',
         use_fast_env=args.fast_env.lower() == 'true',
-        spectate_mode=args.spectate_mode
+        spectate_mode=args.spectate_mode,
+        az_use_last_moves_override=az_use_last_moves,
+        az_use_liberty_features_override=az_use_liberty_features,
+        az_liberty_bins_override=az_liberty_bins,
+        az_use_last_moves_override_b=az_use_last_moves_b,
+        az_use_liberty_features_override_b=az_use_liberty_features_b,
+        az_liberty_bins_override_b=az_liberty_bins_b,
+        debug_model=args.debug_model
     )
     game.run()

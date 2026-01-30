@@ -593,7 +593,7 @@ class AlphaZeroMCTS:
         
         # === Evaluation ===
         # Value Network로 평가
-        board, player, _, last_moves = self._unpack_state(current_state)
+        board, player, passes, last_moves = self._unpack_state(current_state)
         t_pred = time.perf_counter() if self._profile_active else None
         _, value = self._predict(board, player, passes, last_moves)
         if t_pred is not None:

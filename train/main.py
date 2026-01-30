@@ -56,9 +56,15 @@ def main():
     freeze_backbone = profile.get("freeze_backbone", False)
     freeze_backbone_blocks = profile.get("freeze_backbone_blocks")
     freeze_backbone_input = profile.get("freeze_backbone_input", True)
+    freeze_heads = profile.get("freeze_heads", False)
     init_checkpoint = profile.get("init_checkpoint")
     benchmark_interval = profile.get("benchmark_interval", 10)
     freeze_schedule = profile.get("freeze_schedule")
+    freeze_head_schedule = profile.get("freeze_head_schedule")
+    cache_enabled = profile.get("cache_enabled", True)
+    eval_cache_enabled = profile.get("eval_cache_enabled", cache_enabled)
+    eval_profile_timing = profile.get("eval_profile_timing", False)
+    eval_opponent_async = profile.get("eval_opponent_async", False)
 
     # 간단 sanity check (프로필 설정 기준)
     env_cls = GreatKingdomEnvFast if profile.get("use_fast_env") else GreatKingdomEnv
@@ -132,9 +138,11 @@ def main():
         freeze_backbone=freeze_backbone,
         freeze_backbone_blocks=freeze_backbone_blocks,
         freeze_backbone_input=freeze_backbone_input,
+        freeze_heads=freeze_heads,
         init_checkpoint=init_checkpoint,
         benchmark_interval=benchmark_interval,
         freeze_schedule=freeze_schedule,
+        freeze_head_schedule=freeze_head_schedule,
         selfplay_record_interval=profile.get("selfplay_record_interval", 0),
         selfplay_record_dir=profile.get("selfplay_record_dir", "logs/selfplay_records"),
         ownership_loss_weight=profile.get("ownership_loss_weight", 0.2),
@@ -143,7 +151,11 @@ def main():
         win_type_loss_weight=profile.get("win_type_loss_weight", 0.1),
         cache_debug_samples=profile.get("cache_debug_samples", 0),
         cache_max_entries=profile.get("cache_max_entries", 50000),
-        train_buffer_min_factor=profile.get("train_buffer_min_factor", 2.0)
+        train_buffer_min_factor=profile.get("train_buffer_min_factor", 2.0),
+        cache_enabled=cache_enabled,
+        eval_cache_enabled=eval_cache_enabled,
+        eval_opponent_async=eval_opponent_async,
+        eval_profile_timing=eval_profile_timing
     )
 
 
