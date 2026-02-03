@@ -943,7 +943,7 @@ if __name__ == "__main__":
                         help='Fast env/mcts ???? (True/False/auto)')
     parser.add_argument('--mcts_sims', type=int, default=200,
                         help='Pure MCTS 시뮬레이션 횟수')
-    parser.add_argument('--alphazero_sims', type=int, default=500,
+    parser.add_argument('--alphazero_sims', type=int, default=100,
                         help='AlphaZero MCTS 시뮬레이션 횟수')
     parser.add_argument('--board_size', type=int, default=9,
                         help='보드 크기')
